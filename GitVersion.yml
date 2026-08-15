@@ -1,0 +1,9 @@
+# GitVersion 6.x: trunk-based workflow.
+workflow: TrunkBased/preview1
+
+tag-prefix: '[vV]?'
+assembly-versioning-scheme: MajorMinorPatch
+assembly-file-versioning-scheme: MajorMinorPatch
+assembly-informational-format: '{InformationalVersion}'
+commit-message-incrementing: Enabled
+next-version: 0.1.0
