@@ -1,6 +1,7 @@
 # SyntaxCircus.Http.Resilience
 
 [![Build](https://github.com/Syntax-Circus/SyntaxCircus.Http.Resilience/actions/workflows/build.yml/badge.svg)](https://github.com/Syntax-Circus/SyntaxCircus.Http.Resilience/actions/workflows/build.yml)
+[![NuGet](https://img.shields.io/nuget/v/SyntaxCircus.Http.Resilience.svg)](https://www.nuget.org/packages/SyntaxCircus.Http.Resilience)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.txt)
 
 A typed API client base, a Polly-based resilient `HttpClient` registration helper, and a generic cached-token provider — the pieces that keep getting rewritten every time a product calls another API.
