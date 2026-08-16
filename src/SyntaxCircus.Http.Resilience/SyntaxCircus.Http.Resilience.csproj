@@ -6,9 +6,9 @@
     <PackageId>SyntaxCircus.Http.Resilience</PackageId>
     <Title>SyntaxCircus Http Resilience</Title>
     <Description>A typed API client base (JSON + ETag + ProblemDetails translation), a Polly-based resilient HttpClient registration helper, and a generic cached-token provider for worker-to-API auth.</Description>
-    <Authors>SyntaxCircus</Authors>
-    <Company>SyntaxCircus</Company>
-    <Copyright>Copyright © SyntaxCircus</Copyright>
+    <Authors>Syntax Circus LLC</Authors>
+    <Company>Syntax Circus LLC</Company>
+    <Copyright>Copyright © Syntax Circus LLC</Copyright>
     <PackageTags>http;resilience;polly;api-client</PackageTags>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

@@ -1,0 +1,9 @@
+global using System.Net;
+global using System.Net.Http.Json;
+global using System.Text.Json;
+global using Microsoft.Extensions.DependencyInjection;
+global using NSubstitute;
+global using Polly.CircuitBreaker;
+global using Shouldly;
+global using SyntaxCircus.Http.Resilience.Tests.Infrastructure;
+global using Xunit;

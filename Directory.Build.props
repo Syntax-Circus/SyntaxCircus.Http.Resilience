@@ -6,4 +6,8 @@
     <AnalysisLevel>latest-recommended</AnalysisLevel>
     <NoWarn>$(NoWarn);CA1305;CA1707;CA1848</NoWarn>
   </PropertyGroup>
+
+  <PropertyGroup Condition="'$(NCrunch)' == '1'">
+    <DisableGitVersionTask>true</DisableGitVersionTask>
+  </PropertyGroup>
 </Project>

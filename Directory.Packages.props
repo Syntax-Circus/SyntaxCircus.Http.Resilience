@@ -6,5 +6,17 @@
   <ItemGroup>
     <PackageVersion Include="Microsoft.Extensions.Http.Resilience" Version="9.9.0" />
     <PackageVersion Include="GitVersion.MsBuild" Version="6.6.0" />
+
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.Extensions.Http" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
+    <!-- Pinned below xunit.v3 4.0.0 (released 2026-08-14): that release obsoletes the
+         FrontControllerRunSettings constructor NCrunch's xunit.v3 adapter still invokes via
+         reflection, breaking every test under NCrunch. Bump back to latest once NCrunch ships
+         support for the new API shape. -->
+    <PackageVersion Include="xunit.v3" Version="3.2.2" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageVersion Include="NSubstitute" Version="6.2.0" />
+    <PackageVersion Include="Shouldly" Version="4.3.0" />
   </ItemGroup>
 </Project>
