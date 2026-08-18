@@ -118,7 +118,33 @@ public abstract class ApiClientBase(HttpClient httpClient)
     /// <summary>PUTs, attaching <c>If-Match</c> from a cached ETag for this URL when one is known.</summary>
     protected async Task PutAsync<TRequest>(string requestUri, TRequest body, CancellationToken cancellationToken = default)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Put, requestUri)
+        using var request = BuildPutRequest(requestUri, body);
+        await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+        CacheETag(requestUri, response);
+    }
+
+    /// <summary>
+    /// PUTs, attaching <c>If-Match</c> from a cached ETag for this URL when one is known, and returns the
+    /// deserialized response body — for APIs that return the updated resource (e.g. server-computed fields,
+    /// updated timestamps) from a successful update.
+    /// </summary>
+    protected async Task<TResponse?> PutAsync<TRequest, TResponse>(string requestUri, TRequest body, CancellationToken cancellationToken = default)
+    {
+        using var request = BuildPutRequest(requestUri, body);
+        await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+        CacheETag(requestUri, response);
+        return await response.Content.ReadFromJsonAsync<TResponse>(SerializerOptions, cancellationToken).ConfigureAwait(false);
+    }
+
+    private HttpRequestMessage BuildPutRequest<TRequest>(string requestUri, TRequest body)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Put, requestUri)
         {
             Content = JsonContent.Create(body, options: SerializerOptions),
         };
@@ -128,16 +154,18 @@ public abstract class ApiClientBase(HttpClient httpClient)
             request.Headers.TryAddWithoutValidation("If-Match", etag);
         }
 
-        await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
-        using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
-        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
-        CacheETag(requestUri, response);
+        return request;
     }
 
+    /// <summary>DELETEs, attaching <c>If-Match</c> from a cached ETag for this URL when one is known.</summary>
     protected async Task DeleteAsync(string requestUri, CancellationToken cancellationToken = default)
     {
         using var request = new HttpRequestMessage(HttpMethod.Delete, requestUri);
+        if (_etagCache.TryGetValue(requestUri, out var etag))
+        {
+            request.Headers.TryAddWithoutValidation("If-Match", etag);
+        }
+
         await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
         using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);

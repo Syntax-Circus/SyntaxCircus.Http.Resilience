@@ -41,6 +41,9 @@ internal sealed class TestApiClient(HttpClient httpClient) : ApiClientBase(httpC
     public Task Put<TRequest>(string requestUri, TRequest body, CancellationToken cancellationToken = default)
         => PutAsync(requestUri, body, cancellationToken);
 
+    public Task<TResponse?> Put<TRequest, TResponse>(string requestUri, TRequest body, CancellationToken cancellationToken = default)
+        => PutAsync<TRequest, TResponse>(requestUri, body, cancellationToken);
+
     public Task Delete(string requestUri, CancellationToken cancellationToken = default)
         => DeleteAsync(requestUri, cancellationToken);
 

@@ -176,6 +176,54 @@ public class ApiClientBaseTests
     }
 
     [Fact]
+    public async Task PutAsyncWithResponse_Success_ReturnsDeserializedBody()
+    {
+        var (client, _) = CreateClient(_ => JsonResponse(HttpStatusCode.OK, new TestPayload("widget-updated", 6)));
+
+        var result = await client.Put<TestPayload, TestPayload>("/things/1", new TestPayload("widget", 5), TestContext.Current.CancellationToken);
+
+        result.ShouldNotBeNull();
+        result.Name.ShouldBe("widget-updated");
+        result.Value.ShouldBe(6);
+    }
+
+    [Fact]
+    public async Task PutAsyncWithResponse_CachedETagFromPriorGet_SendsIfMatchHeaderAndCachesNewETag()
+    {
+        var (client, handler) = CreateClient(req =>
+        {
+            if (req.Method == HttpMethod.Get)
+            {
+                var getResponse = JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5));
+                getResponse.Headers.ETag = new EntityTagHeaderValue("\"etag-1\"");
+                return getResponse;
+            }
+
+            var putResponse = JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 6));
+            putResponse.Headers.ETag = new EntityTagHeaderValue("\"etag-2\"");
+            return putResponse;
+        });
+
+        await client.GetWithETag<TestPayload>("/things/1", TestContext.Current.CancellationToken);
+        await client.Put<TestPayload, TestPayload>("/things/1", new TestPayload("widget", 6), TestContext.Current.CancellationToken);
+
+        handler.LastRequest!.HeaderValue("If-Match").ShouldBe("\"etag-1\"");
+
+        // A subsequent delete should carry the newly-cached ETag from the PUT response, not the stale GET one.
+        await client.Delete("/things/1", TestContext.Current.CancellationToken);
+        handler.LastRequest!.HeaderValue("If-Match").ShouldBe("\"etag-2\"");
+    }
+
+    [Fact]
+    public async Task PutAsyncWithResponse_ErrorResponse_ThrowsProblemDetailsException()
+    {
+        var (client, _) = CreateClient(_ => ProblemResponse(HttpStatusCode.BadRequest, new { title = "Bad Request" }));
+
+        await Should.ThrowAsync<ProblemDetailsException>(() =>
+            client.Put<TestPayload, TestPayload>("/things/1", new TestPayload("widget", 5), TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
     public async Task DeleteAsync_Success_RemovesCachedETagForUri()
     {
         var (client, handler) = CreateClient(req =>
@@ -195,6 +243,37 @@ public class ApiClientBaseTests
         await client.GetWithETag<TestPayload>("/things/1", TestContext.Current.CancellationToken);
 
         handler.LastRequest!.HeaderValue("If-None-Match").ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task DeleteAsync_NoCachedETag_SendsNoIfMatchHeader()
+    {
+        var (client, handler) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.OK));
+
+        await client.Delete("/things/1", TestContext.Current.CancellationToken);
+
+        handler.LastRequest!.HeaderValue("If-Match").ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task DeleteAsync_CachedETagFromPriorGet_SendsIfMatchHeader()
+    {
+        var (client, handler) = CreateClient(req =>
+        {
+            if (req.Method == HttpMethod.Get)
+            {
+                var getResponse = JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5));
+                getResponse.Headers.ETag = new EntityTagHeaderValue("\"etag-1\"");
+                return getResponse;
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        });
+
+        await client.GetWithETag<TestPayload>("/things/1", TestContext.Current.CancellationToken);
+        await client.Delete("/things/1", TestContext.Current.CancellationToken);
+
+        handler.LastRequest!.HeaderValue("If-Match").ShouldBe("\"etag-1\"");
     }
 
     [Fact]
@@ -430,6 +509,16 @@ public class ApiClientBaseTests
         var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.OK));
 
         await client.Put("/things/1", new TestPayload("widget", 5), TestContext.Current.CancellationToken);
+
+        client.ObservedRequests.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task PutAsyncWithResponse_InvokesOnRequestSendingHookOnce()
+    {
+        var (client, _) = CreateClient(_ => JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5)));
+
+        await client.Put<TestPayload, TestPayload>("/things/1", new TestPayload("widget", 5), TestContext.Current.CancellationToken);
 
         client.ObservedRequests.Count.ShouldBe(1);
     }
