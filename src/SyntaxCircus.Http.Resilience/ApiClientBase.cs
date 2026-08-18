@@ -9,6 +9,8 @@ namespace SyntaxCircus.Http.Resilience;
 /// with conditional GET / <c>If-Match</c>, and centralized ProblemDetails-to-exception translation.
 /// Bearer-token attachment is left to the caller — e.g. a <c>DelegatingHandler</c> registered on
 /// the typed client via <c>AddHttpMessageHandler</c> — this class only shapes requests/responses.
+/// Override <see cref="OnResponseReceivedAsync"/> to observe response headers (e.g. a sliding
+/// session-expiry header) on every call without re-implementing the verb helpers.
 /// </summary>
 public abstract class ApiClientBase(HttpClient httpClient)
 {
@@ -18,9 +20,20 @@ public abstract class ApiClientBase(HttpClient httpClient)
 
     protected HttpClient HttpClient { get; } = httpClient;
 
+    /// <summary>
+    /// Called after every response this client receives — success or error — before
+    /// success/error handling (<see cref="EnsureSuccessAsync"/>) runs. No-op by default;
+    /// override to observe response headers (e.g. a sliding session-expiry header) without
+    /// re-implementing the verb helpers or overriding <c>SendAsync</c> on the underlying
+    /// <see cref="HttpClient"/>.
+    /// </summary>
+    protected virtual Task OnResponseReceivedAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+        => Task.CompletedTask;
+
     protected async Task<T?> GetAsync<T>(string requestUri, CancellationToken cancellationToken = default)
     {
         using var response = await HttpClient.GetAsync(requestUri, cancellationToken).ConfigureAwait(false);
+        await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         return await response.Content.ReadFromJsonAsync<T>(SerializerOptions, cancellationToken).ConfigureAwait(false);
     }
@@ -35,6 +48,7 @@ public abstract class ApiClientBase(HttpClient httpClient)
         }
 
         using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotModified)
         {
             return default;
@@ -48,6 +62,7 @@ public abstract class ApiClientBase(HttpClient httpClient)
     protected async Task<TResponse?> PostAsync<TRequest, TResponse>(string requestUri, TRequest body, CancellationToken cancellationToken = default)
     {
         using var response = await HttpClient.PostAsJsonAsync(requestUri, body, SerializerOptions, cancellationToken).ConfigureAwait(false);
+        await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         return await response.Content.ReadFromJsonAsync<TResponse>(SerializerOptions, cancellationToken).ConfigureAwait(false);
     }
@@ -55,6 +70,7 @@ public abstract class ApiClientBase(HttpClient httpClient)
     protected async Task PostAsync<TRequest>(string requestUri, TRequest body, CancellationToken cancellationToken = default)
     {
         using var response = await HttpClient.PostAsJsonAsync(requestUri, body, SerializerOptions, cancellationToken).ConfigureAwait(false);
+        await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -72,6 +88,7 @@ public abstract class ApiClientBase(HttpClient httpClient)
         }
 
         using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         CacheETag(requestUri, response);
     }
@@ -79,6 +96,7 @@ public abstract class ApiClientBase(HttpClient httpClient)
     protected async Task DeleteAsync(string requestUri, CancellationToken cancellationToken = default)
     {
         using var response = await HttpClient.DeleteAsync(requestUri, cancellationToken).ConfigureAwait(false);
+        await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         _etagCache.Remove(requestUri);
     }

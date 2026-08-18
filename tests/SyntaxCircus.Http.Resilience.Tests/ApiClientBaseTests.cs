@@ -204,4 +204,75 @@ public class ApiClientBaseTests
 
         await Should.ThrowAsync<ProblemDetailsException>(() => client.Delete("/things/1", TestContext.Current.CancellationToken));
     }
+
+    [Fact]
+    public async Task GetAsync_Success_InvokesOnResponseReceivedHookOnce()
+    {
+        var (client, _) = CreateClient(_ => JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5)));
+
+        await client.Get<TestPayload>("/things/1", TestContext.Current.CancellationToken);
+
+        client.ObservedResponses.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task GetAsync_ErrorResponse_StillInvokesOnResponseReceivedHook()
+    {
+        var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        await Should.ThrowAsync<ProblemDetailsException>(() => client.Get<TestPayload>("/things/1", TestContext.Current.CancellationToken));
+
+        client.ObservedResponses.Count.ShouldBe(1);
+        client.ObservedResponses[0].StatusCode.ShouldBe(HttpStatusCode.InternalServerError);
+    }
+
+    [Fact]
+    public async Task GetWithETagAsync_NotModified_StillInvokesOnResponseReceivedHook()
+    {
+        var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.NotModified));
+
+        await client.GetWithETag<TestPayload>("/things/1", TestContext.Current.CancellationToken);
+
+        client.ObservedResponses.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task PostAsync_WithResponseBody_InvokesOnResponseReceivedHookOnce()
+    {
+        var (client, _) = CreateClient(_ => JsonResponse(HttpStatusCode.Created, new TestPayload("created", 1)));
+
+        await client.Post<TestPayload, TestPayload>("/things", new TestPayload("widget", 5), TestContext.Current.CancellationToken);
+
+        client.ObservedResponses.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task PostAsync_WithoutResponseBody_InvokesOnResponseReceivedHookOnce()
+    {
+        var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.NoContent));
+
+        await client.Post("/things", new TestPayload("widget", 5), TestContext.Current.CancellationToken);
+
+        client.ObservedResponses.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task PutAsync_InvokesOnResponseReceivedHookOnce()
+    {
+        var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.OK));
+
+        await client.Put("/things/1", new TestPayload("widget", 5), TestContext.Current.CancellationToken);
+
+        client.ObservedResponses.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_InvokesOnResponseReceivedHookOnce()
+    {
+        var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.OK));
+
+        await client.Delete("/things/1", TestContext.Current.CancellationToken);
+
+        client.ObservedResponses.Count.ShouldBe(1);
+    }
 }

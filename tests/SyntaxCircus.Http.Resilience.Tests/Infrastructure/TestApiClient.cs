@@ -3,6 +3,16 @@ namespace SyntaxCircus.Http.Resilience.Tests.Infrastructure;
 /// <summary>Exposes <see cref="ApiClientBase"/>'s protected members for direct testing.</summary>
 internal sealed class TestApiClient(HttpClient httpClient) : ApiClientBase(httpClient)
 {
+    private readonly List<HttpResponseMessage> _observedResponses = [];
+
+    public IReadOnlyList<HttpResponseMessage> ObservedResponses => _observedResponses;
+
+    protected override Task OnResponseReceivedAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        _observedResponses.Add(response);
+        return Task.CompletedTask;
+    }
+
     public Task<T?> Get<T>(string requestUri, CancellationToken cancellationToken = default)
         => GetAsync<T>(requestUri, cancellationToken);
 
