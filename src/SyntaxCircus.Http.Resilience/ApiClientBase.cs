@@ -38,11 +38,20 @@ public abstract class ApiClientBase(HttpClient httpClient)
         return await response.Content.ReadFromJsonAsync<T>(SerializerOptions, cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>GETs with a conditional request when a cached ETag exists for this URL; returns <c>default</c> on a 304.</summary>
-    protected async Task<T?> GetWithETagAsync<T>(string requestUri, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// GETs with a conditional request when a cached ETag exists for this URL; returns <c>default</c> on a 304.
+    /// Pass <paramref name="useConditionalRequest"/> as <see langword="false"/> to always issue a plain GET (no
+    /// <c>If-None-Match</c>, never a 304) while still caching the response's ETag for a later
+    /// <see cref="PutAsync{TRequest}"/>/<see cref="DeleteAsync"/> — useful for long-lived typed-client instances
+    /// (e.g. one per Blazor Server circuit) where a caller always wants a fresh body from a "load for edit"
+    /// call, even if the same URL was already read earlier in the same client's lifetime.
+    /// </summary>
+#pragma warning disable CA1068 // Non-breaking parameter addition: cancellationToken must stay in its original (non-last) position to avoid a breaking change to existing callers.
+    protected async Task<T?> GetWithETagAsync<T>(string requestUri, CancellationToken cancellationToken = default, bool useConditionalRequest = true)
+#pragma warning restore CA1068
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
-        if (_etagCache.TryGetValue(requestUri, out var etag))
+        if (useConditionalRequest && _etagCache.TryGetValue(requestUri, out var etag))
         {
             request.Headers.TryAddWithoutValidation("If-None-Match", etag);
         }
@@ -100,6 +109,34 @@ public abstract class ApiClientBase(HttpClient httpClient)
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         _etagCache.Remove(requestUri);
     }
+
+    /// <summary>
+    /// Sends an arbitrary <see cref="HttpRequestMessage"/> (e.g. multipart form content, or a binary
+    /// download) through the same pipeline as the JSON verb helpers: <see cref="OnResponseReceivedAsync"/>,
+    /// ProblemDetails translation on non-success, and ETag caching for the request URI on success. Use this
+    /// when the JSON-shaped <c>GetAsync</c>/<c>PostAsync</c>/<c>PutAsync</c>/<c>DeleteAsync</c> helpers don't
+    /// fit (non-JSON request bodies, custom headers, streamed responses). The caller owns disposing the
+    /// returned response and reading its content (see <see cref="ReadJsonAsync{T}"/> for a JSON body).
+    /// </summary>
+    protected async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
+    {
+        // HttpClient.SendAsync mutates RequestUri in place (resolving it against BaseAddress), so capture the
+        // caller's original URI string before sending — matching the exact string other verb helpers cache under.
+        var requestUri = request.RequestUri?.OriginalString;
+        var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+        if (requestUri is not null)
+        {
+            CacheETag(requestUri, response);
+        }
+
+        return response;
+    }
+
+    /// <summary>Reads a JSON response body with this class's <see cref="SerializerOptions"/>. Pairs with <see cref="SendAsync"/>.</summary>
+    protected static Task<T?> ReadJsonAsync<T>(HttpResponseMessage response, CancellationToken cancellationToken = default) =>
+        response.Content.ReadFromJsonAsync<T>(SerializerOptions, cancellationToken);
 
     private void CacheETag(string requestUri, HttpResponseMessage response)
     {

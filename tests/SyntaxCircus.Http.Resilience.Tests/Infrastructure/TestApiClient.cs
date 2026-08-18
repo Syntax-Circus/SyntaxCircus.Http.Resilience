@@ -16,8 +16,10 @@ internal sealed class TestApiClient(HttpClient httpClient) : ApiClientBase(httpC
     public Task<T?> Get<T>(string requestUri, CancellationToken cancellationToken = default)
         => GetAsync<T>(requestUri, cancellationToken);
 
-    public Task<T?> GetWithETag<T>(string requestUri, CancellationToken cancellationToken = default)
-        => GetWithETagAsync<T>(requestUri, cancellationToken);
+#pragma warning disable CA1068 // Mirrors ApiClientBase.GetWithETagAsync's intentional non-last cancellationToken.
+    public Task<T?> GetWithETag<T>(string requestUri, CancellationToken cancellationToken = default, bool useConditionalRequest = true)
+#pragma warning restore CA1068
+        => GetWithETagAsync<T>(requestUri, cancellationToken, useConditionalRequest);
 
     public Task<TResponse?> Post<TRequest, TResponse>(string requestUri, TRequest body, CancellationToken cancellationToken = default)
         => PostAsync<TRequest, TResponse>(requestUri, body, cancellationToken);
@@ -30,4 +32,10 @@ internal sealed class TestApiClient(HttpClient httpClient) : ApiClientBase(httpC
 
     public Task Delete(string requestUri, CancellationToken cancellationToken = default)
         => DeleteAsync(requestUri, cancellationToken);
+
+    public Task<HttpResponseMessage> Send(HttpRequestMessage request, CancellationToken cancellationToken = default)
+        => SendAsync(request, cancellationToken);
+
+    public static Task<T?> ReadJson<T>(HttpResponseMessage response, CancellationToken cancellationToken = default)
+        => ReadJsonAsync<T>(response, cancellationToken);
 }

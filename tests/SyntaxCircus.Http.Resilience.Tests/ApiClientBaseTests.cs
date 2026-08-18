@@ -275,4 +275,101 @@ public class ApiClientBaseTests
 
         client.ObservedResponses.Count.ShouldBe(1);
     }
+
+    [Fact]
+    public async Task GetWithETagAsync_UseConditionalRequestFalse_NeverSendsIfNoneMatchEvenWithCachedETag()
+    {
+        var (client, handler) = CreateClient(_ =>
+        {
+            var response = JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5));
+            response.Headers.ETag = new EntityTagHeaderValue("\"etag-1\"");
+            return response;
+        });
+
+        await client.GetWithETag<TestPayload>("/things/1", TestContext.Current.CancellationToken, useConditionalRequest: false);
+        var result = await client.GetWithETag<TestPayload>("/things/1", TestContext.Current.CancellationToken, useConditionalRequest: false);
+
+        handler.LastRequest!.HeaderValue("If-None-Match").ShouldBeNull();
+        result.ShouldBe(new TestPayload("widget", 5));
+    }
+
+    [Fact]
+    public async Task GetWithETagAsync_UseConditionalRequestFalse_StillCachesETagForSubsequentPut()
+    {
+        var (client, handler) = CreateClient(req =>
+        {
+            if (req.Method == HttpMethod.Get)
+            {
+                var getResponse = JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5));
+                getResponse.Headers.ETag = new EntityTagHeaderValue("\"etag-1\"");
+                return getResponse;
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        });
+
+        await client.GetWithETag<TestPayload>("/things/1", TestContext.Current.CancellationToken, useConditionalRequest: false);
+        await client.Put("/things/1", new TestPayload("widget", 6), TestContext.Current.CancellationToken);
+
+        handler.LastRequest!.HeaderValue("If-Match").ShouldBe("\"etag-1\"");
+    }
+
+    [Fact]
+    public async Task GetWithETagAsync_UseConditionalRequestTrue_DefaultBehaviorUnchanged()
+    {
+        var (client, handler) = CreateClient(req =>
+        {
+            var response = JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5));
+            response.Headers.ETag = new EntityTagHeaderValue("\"etag-1\"");
+            return response;
+        });
+
+        await client.GetWithETag<TestPayload>("/things/1", TestContext.Current.CancellationToken);
+        await client.GetWithETag<TestPayload>("/things/1", TestContext.Current.CancellationToken);
+
+        handler.LastRequest!.HeaderValue("If-None-Match").ShouldBe("\"etag-1\"");
+    }
+
+    [Fact]
+    public async Task SendAsync_CustomRequest_Success_ReturnsResponseAndCachesETag()
+    {
+        var (client, handler) = CreateClient(req =>
+        {
+            var response = JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5));
+            response.Headers.ETag = new EntityTagHeaderValue("\"etag-1\"");
+            return response;
+        });
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/things/upload") { Content = new StringContent("payload") };
+        using var response = await client.Send(request, TestContext.Current.CancellationToken);
+        var body = await TestApiClient.ReadJson<TestPayload>(response, TestContext.Current.CancellationToken);
+
+        body.ShouldBe(new TestPayload("widget", 5));
+        handler.CallCount.ShouldBe(1);
+
+        // The cached ETag from the SendAsync call should be attached as If-Match on a subsequent PUT to the same URI.
+        await client.Put("/things/upload", new TestPayload("widget", 6), TestContext.Current.CancellationToken);
+        handler.LastRequest!.HeaderValue("If-Match").ShouldBe("\"etag-1\"");
+    }
+
+    [Fact]
+    public async Task SendAsync_CustomRequest_ErrorResponse_ThrowsProblemDetailsException()
+    {
+        var (client, _) = CreateClient(_ => ProblemResponse(HttpStatusCode.BadRequest, new { title = "Bad Request" }));
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/things/upload") { Content = new StringContent("payload") };
+
+        await Should.ThrowAsync<ProblemDetailsException>(() => client.Send(request, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task SendAsync_CustomRequest_InvokesOnResponseReceivedHookOnce()
+    {
+        var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.OK));
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/things/download");
+        using var response = await client.Send(request, TestContext.Current.CancellationToken);
+
+        client.ObservedResponses.Count.ShouldBe(1);
+    }
 }

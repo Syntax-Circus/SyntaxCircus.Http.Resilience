@@ -21,6 +21,19 @@ public sealed class WidgetApiClient(HttpClient httpClient) : ApiClientBase(httpC
 
 JSON `GetAsync`/`GetWithETagAsync` (conditional GET with a per-URL ETag cache)/`PostAsync`/`PutAsync` (with `If-Match` from the cached ETag)/`DeleteAsync`, and centralized error handling: a non-success response is translated into a `ProblemDetailsException` (`StatusCode`, `Type`, `Title`, `Errors`) when the body is an RFC 7807 ProblemDetails payload. Bearer-token attachment is left to the caller — register a `DelegatingHandler` on the typed client via `AddHttpMessageHandler<T>()` rather than baking auth into the base class.
 
+`GetWithETagAsync` takes an optional `useConditionalRequest` parameter (default `true`, preserving the conditional-GET/304 behavior above). Pass `false` for a "load for edit" call that should always return a fresh body — no `If-None-Match` is sent and a 304 can never happen, but the response's ETag is still cached for a subsequent `PutAsync`/`DeleteAsync` on the same URL. Useful for long-lived typed-client instances (e.g. one per web-app session/circuit) where a caller reads the same URL more than once and always wants the current value, not a cached-away 304.
+
+Need to send something the JSON verb helpers don't fit — multipart form content, a binary download, custom headers? Use `SendAsync(HttpRequestMessage, ct)` / `ReadJsonAsync<T>(HttpResponseMessage, ct)`, protected members that run the same `OnResponseReceivedAsync` hook, ProblemDetails translation, and ETag caching as the verb helpers, while leaving you in control of the request/response shape:
+
+```csharp
+public async Task<Widget> UploadAsync(Stream file, CancellationToken ct)
+{
+    using var request = new HttpRequestMessage(HttpMethod.Post, "widgets/upload") { Content = new StreamContent(file) };
+    using var response = await SendAsync(request, ct);
+    return (await ReadJsonAsync<Widget>(response, ct))!;
+}
+```
+
 ## AddResilientHttpClient
 
 ```csharp
