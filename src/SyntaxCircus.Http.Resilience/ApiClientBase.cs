@@ -8,9 +8,15 @@ namespace SyntaxCircus.Http.Resilience;
 /// Base class for typed HTTP API clients: JSON GET/POST/PUT/DELETE helpers, per-URL ETag caching
 /// with conditional GET / <c>If-Match</c>, and centralized ProblemDetails-to-exception translation.
 /// Bearer-token attachment is left to the caller — e.g. a <c>DelegatingHandler</c> registered on
-/// the typed client via <c>AddHttpMessageHandler</c> — this class only shapes requests/responses.
-/// Override <see cref="OnResponseReceivedAsync"/> to observe response headers (e.g. a sliding
-/// session-expiry header) on every call without re-implementing the verb helpers.
+/// the typed client via <c>AddHttpMessageHandler</c> for app-wide/singleton-safe auth (such as
+/// <see cref="CachedTokenProvider"/>-backed client-credentials tokens), or by overriding
+/// <see cref="OnRequestSendingAsync"/> in a derived class when auth is scoped to something only
+/// available in the same DI scope as the typed client itself (e.g. a per-user/per-session token in
+/// a web app) — <c>AddHttpMessageHandler</c>-registered handlers are resolved from a pooled,
+/// periodically-rotated handler scope, not the caller's ambient scope, so they should only depend on
+/// singleton-safe services. Override <see cref="OnResponseReceivedAsync"/> to observe response
+/// headers (e.g. a sliding session-expiry header) on every call without re-implementing the verb
+/// helpers.
 /// </summary>
 public abstract class ApiClientBase(HttpClient httpClient)
 {
@@ -19,6 +25,17 @@ public abstract class ApiClientBase(HttpClient httpClient)
     private readonly Dictionary<string, string> _etagCache = new(StringComparer.Ordinal);
 
     protected HttpClient HttpClient { get; } = httpClient;
+
+    /// <summary>
+    /// Called immediately before every request this client sends, after the request has been fully
+    /// built (URL, conditional/ETag headers, JSON body) but before it's dispatched. No-op by default;
+    /// override to attach cross-cutting request headers (e.g. bearer-token auth, a correlation ID)
+    /// from a dependency that must be resolved in the same DI scope as the typed client itself —
+    /// unlike a <c>DelegatingHandler</c> added via <c>AddHttpMessageHandler</c>, which is created in a
+    /// separate, pooled scope and so shouldn't depend on scoped/per-request services.
+    /// </summary>
+    protected virtual Task OnRequestSendingAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        => Task.CompletedTask;
 
     /// <summary>
     /// Called after every response this client receives — success or error — before
@@ -32,7 +49,9 @@ public abstract class ApiClientBase(HttpClient httpClient)
 
     protected async Task<T?> GetAsync<T>(string requestUri, CancellationToken cancellationToken = default)
     {
-        using var response = await HttpClient.GetAsync(requestUri, cancellationToken).ConfigureAwait(false);
+        using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+        await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         return await response.Content.ReadFromJsonAsync<T>(SerializerOptions, cancellationToken).ConfigureAwait(false);
@@ -56,6 +75,7 @@ public abstract class ApiClientBase(HttpClient httpClient)
             request.Headers.TryAddWithoutValidation("If-None-Match", etag);
         }
 
+        await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
         using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotModified)
@@ -70,7 +90,13 @@ public abstract class ApiClientBase(HttpClient httpClient)
 
     protected async Task<TResponse?> PostAsync<TRequest, TResponse>(string requestUri, TRequest body, CancellationToken cancellationToken = default)
     {
-        using var response = await HttpClient.PostAsJsonAsync(requestUri, body, SerializerOptions, cancellationToken).ConfigureAwait(false);
+        using var request = new HttpRequestMessage(HttpMethod.Post, requestUri)
+        {
+            Content = JsonContent.Create(body, options: SerializerOptions),
+        };
+
+        await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         return await response.Content.ReadFromJsonAsync<TResponse>(SerializerOptions, cancellationToken).ConfigureAwait(false);
@@ -78,7 +104,13 @@ public abstract class ApiClientBase(HttpClient httpClient)
 
     protected async Task PostAsync<TRequest>(string requestUri, TRequest body, CancellationToken cancellationToken = default)
     {
-        using var response = await HttpClient.PostAsJsonAsync(requestUri, body, SerializerOptions, cancellationToken).ConfigureAwait(false);
+        using var request = new HttpRequestMessage(HttpMethod.Post, requestUri)
+        {
+            Content = JsonContent.Create(body, options: SerializerOptions),
+        };
+
+        await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
@@ -96,6 +128,7 @@ public abstract class ApiClientBase(HttpClient httpClient)
             request.Headers.TryAddWithoutValidation("If-Match", etag);
         }
 
+        await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
         using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
@@ -104,7 +137,9 @@ public abstract class ApiClientBase(HttpClient httpClient)
 
     protected async Task DeleteAsync(string requestUri, CancellationToken cancellationToken = default)
     {
-        using var response = await HttpClient.DeleteAsync(requestUri, cancellationToken).ConfigureAwait(false);
+        using var request = new HttpRequestMessage(HttpMethod.Delete, requestUri);
+        await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         _etagCache.Remove(requestUri);
@@ -112,17 +147,19 @@ public abstract class ApiClientBase(HttpClient httpClient)
 
     /// <summary>
     /// Sends an arbitrary <see cref="HttpRequestMessage"/> (e.g. multipart form content, or a binary
-    /// download) through the same pipeline as the JSON verb helpers: <see cref="OnResponseReceivedAsync"/>,
-    /// ProblemDetails translation on non-success, and ETag caching for the request URI on success. Use this
-    /// when the JSON-shaped <c>GetAsync</c>/<c>PostAsync</c>/<c>PutAsync</c>/<c>DeleteAsync</c> helpers don't
-    /// fit (non-JSON request bodies, custom headers, streamed responses). The caller owns disposing the
-    /// returned response and reading its content (see <see cref="ReadJsonAsync{T}"/> for a JSON body).
+    /// download) through the same pipeline as the JSON verb helpers: <see cref="OnRequestSendingAsync"/>,
+    /// <see cref="OnResponseReceivedAsync"/>, ProblemDetails translation on non-success, and ETag caching
+    /// for the request URI on success. Use this when the JSON-shaped
+    /// <c>GetAsync</c>/<c>PostAsync</c>/<c>PutAsync</c>/<c>DeleteAsync</c> helpers don't fit (non-JSON
+    /// request bodies, custom headers, streamed responses). The caller owns disposing the returned
+    /// response and reading its content (see <see cref="ReadJsonAsync{T}"/> for a JSON body).
     /// </summary>
     protected async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken = default)
     {
         // HttpClient.SendAsync mutates RequestUri in place (resolving it against BaseAddress), so capture the
         // caller's original URI string before sending — matching the exact string other verb helpers cache under.
         var requestUri = request.RequestUri?.OriginalString;
+        await OnRequestSendingAsync(request, cancellationToken).ConfigureAwait(false);
         var response = await HttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         await OnResponseReceivedAsync(response, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);

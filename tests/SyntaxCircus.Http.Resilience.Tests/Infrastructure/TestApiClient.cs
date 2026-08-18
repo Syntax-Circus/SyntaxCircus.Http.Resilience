@@ -13,6 +13,17 @@ internal sealed class TestApiClient(HttpClient httpClient) : ApiClientBase(httpC
         return Task.CompletedTask;
     }
 
+    public List<HttpRequestMessage> ObservedRequests { get; } = [];
+
+    protected override Task OnRequestSendingAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        ObservedRequests.Add(request);
+        MutateRequest?.Invoke(request);
+        return Task.CompletedTask;
+    }
+
+    public Action<HttpRequestMessage>? MutateRequest { get; set; }
+
     public Task<T?> Get<T>(string requestUri, CancellationToken cancellationToken = default)
         => GetAsync<T>(requestUri, cancellationToken);
 

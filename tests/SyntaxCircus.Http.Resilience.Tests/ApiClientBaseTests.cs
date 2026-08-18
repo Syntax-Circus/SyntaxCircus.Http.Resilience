@@ -372,4 +372,86 @@ public class ApiClientBaseTests
 
         client.ObservedResponses.Count.ShouldBe(1);
     }
+
+    [Fact]
+    public async Task SendAsync_CustomRequest_InvokesOnRequestSendingHookOnce()
+    {
+        var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.OK));
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/things/download");
+        using var response = await client.Send(request, TestContext.Current.CancellationToken);
+
+        client.ObservedRequests.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task GetAsync_InvokesOnRequestSendingHookOnce()
+    {
+        var (client, _) = CreateClient(_ => JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5)));
+
+        await client.Get<TestPayload>("/things/1", TestContext.Current.CancellationToken);
+
+        client.ObservedRequests.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task GetWithETagAsync_InvokesOnRequestSendingHookOnce()
+    {
+        var (client, _) = CreateClient(_ => JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5)));
+
+        await client.GetWithETag<TestPayload>("/things/1", TestContext.Current.CancellationToken);
+
+        client.ObservedRequests.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task PostAsync_WithResponseBody_InvokesOnRequestSendingHookOnce()
+    {
+        var (client, _) = CreateClient(_ => JsonResponse(HttpStatusCode.Created, new TestPayload("created", 1)));
+
+        await client.Post<TestPayload, TestPayload>("/things", new TestPayload("widget", 5), TestContext.Current.CancellationToken);
+
+        client.ObservedRequests.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task PostAsync_WithoutResponseBody_InvokesOnRequestSendingHookOnce()
+    {
+        var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.NoContent));
+
+        await client.Post("/things", new TestPayload("widget", 5), TestContext.Current.CancellationToken);
+
+        client.ObservedRequests.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task PutAsync_InvokesOnRequestSendingHookOnce()
+    {
+        var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.OK));
+
+        await client.Put("/things/1", new TestPayload("widget", 5), TestContext.Current.CancellationToken);
+
+        client.ObservedRequests.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_InvokesOnRequestSendingHookOnce()
+    {
+        var (client, _) = CreateClient(_ => new HttpResponseMessage(HttpStatusCode.OK));
+
+        await client.Delete("/things/1", TestContext.Current.CancellationToken);
+
+        client.ObservedRequests.Count.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task OnRequestSendingAsync_CanAttachHeaderThatReachesTheWire()
+    {
+        var (client, handler) = CreateClient(_ => JsonResponse(HttpStatusCode.OK, new TestPayload("widget", 5)));
+        client.MutateRequest = request => request.Headers.TryAddWithoutValidation("Authorization", "Bearer test-token");
+
+        await client.Get<TestPayload>("/things/1", TestContext.Current.CancellationToken);
+
+        handler.LastRequest!.HeaderValue("Authorization").ShouldBe("Bearer test-token");
+    }
 }
