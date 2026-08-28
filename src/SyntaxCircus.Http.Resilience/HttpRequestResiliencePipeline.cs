@@ -4,6 +4,7 @@ namespace SyntaxCircus.Http.Resilience;
 
 public sealed class HttpRequestResiliencePipeline
 {
+    private readonly string _name;
     private readonly HttpRequestResilienceOptions _options;
 
     public HttpRequestResiliencePipeline(string name, HttpRequestResilienceOptions options)
@@ -13,6 +14,7 @@ public sealed class HttpRequestResiliencePipeline
 
         Validate(options);
 
+        _name = name;
         _options = new HttpRequestResilienceOptions
         {
             MaxAttempts = options.MaxAttempts,

@@ -178,6 +178,16 @@ public class HttpRequestResilienceOptionsTests
     }
 
     [Fact]
+    public void Constructor_RetainsValidatedPipelineName()
+    {
+        var pipeline = new HttpRequestResiliencePipeline("cmsify", new HttpRequestResilienceOptions());
+        var nameField = typeof(HttpRequestResiliencePipeline).GetField("_name", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        nameField.ShouldNotBeNull();
+        nameField.GetValue(pipeline).ShouldBe("cmsify");
+    }
+
+    [Fact]
     public void TimeoutException_ExposesPipelineNameTimeoutAndInnerException()
     {
         var innerException = new InvalidOperationException("inner");
