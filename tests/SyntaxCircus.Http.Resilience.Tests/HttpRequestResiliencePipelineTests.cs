@@ -442,6 +442,59 @@ public class HttpRequestResiliencePipelineTests
     }
 
     [Fact]
+    public async Task SendAsync_MaximumBreakDurationRemainsOpenWithOneTickSamplingWindow()
+    {
+        var timeProvider = new ManualTimeProvider();
+        var factoryCalls = 0;
+        var pipeline = CreatePipeline(
+            timeProvider,
+            maxAttempts: 1,
+            circuitMinimumThroughput: 2,
+            circuitSamplingDuration: TimeSpan.FromTicks(1),
+            circuitBreakDuration: TimeSpan.MaxValue);
+
+        for (var i = 0; i < 2; i++)
+        {
+            using var response = await pipeline.SendAsync(
+                (_, _) =>
+                {
+                    factoryCalls++;
+                    return ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/failure"));
+                },
+                (_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)),
+                HttpCompletionOption.ResponseHeadersRead,
+                HttpRequestReplaySafety.Replayable,
+                cancellationToken: TestContext.Current.CancellationToken);
+        }
+
+        timeProvider.Advance(TimeSpan.FromDays(3));
+
+        HttpCircuitOpenException? rejection = null;
+        try
+        {
+            using var unexpectedResponse = await pipeline.SendAsync(
+                (_, _) =>
+                {
+                    factoryCalls++;
+                    return ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/probe"));
+                },
+                (_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)),
+                HttpCompletionOption.ResponseHeadersRead,
+                HttpRequestReplaySafety.Replayable,
+                cancellationToken: TestContext.Current.CancellationToken);
+        }
+        catch (HttpCircuitOpenException exception)
+        {
+            rejection = exception;
+        }
+
+        rejection.ShouldNotBeNull();
+        rejection.RetryAfter.ShouldNotBeNull();
+        rejection.RetryAfter.Value.ShouldBe(TimeSpan.MaxValue - TimeSpan.FromDays(3));
+        factoryCalls.ShouldBe(2);
+    }
+
+    [Fact]
     public async Task SendAsync_CircuitTransitionsHalfOpenAndClosedWithSafeTelemetry()
     {
         var timeProvider = new ManualTimeProvider();
@@ -605,6 +658,7 @@ public class HttpRequestResiliencePipelineTests
         TimeSpan? maximumDelay = null,
         int circuitMinimumThroughput = 20,
         TimeSpan? circuitSamplingDuration = null,
+        TimeSpan? circuitBreakDuration = null,
         Func<double>? jitterProvider = null,
         Func<HttpRetryTelemetry, CancellationToken, ValueTask>? onRetry = null,
         Func<HttpCircuitTelemetry, CancellationToken, ValueTask>? onCircuit = null)
@@ -617,7 +671,7 @@ public class HttpRequestResiliencePipelineTests
             CircuitFailureRatio = 0.5,
             CircuitMinimumThroughput = circuitMinimumThroughput,
             CircuitSamplingDuration = circuitSamplingDuration ?? TimeSpan.FromSeconds(30),
-            CircuitBreakDuration = TimeSpan.FromSeconds(5),
+            CircuitBreakDuration = circuitBreakDuration ?? TimeSpan.FromSeconds(5),
             TimeProvider = timeProvider,
             JitterProvider = jitterProvider ?? (() => 0),
             OnRetry = onRetry,

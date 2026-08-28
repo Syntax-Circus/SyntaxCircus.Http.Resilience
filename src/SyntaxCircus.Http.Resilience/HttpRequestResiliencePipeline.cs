@@ -1,4 +1,5 @@
 using System.Net.Http;
+using System.Numerics;
 using Polly;
 using Polly.CircuitBreaker;
 using Polly.Retry;
@@ -8,6 +9,7 @@ namespace SyntaxCircus.Http.Resilience;
 public sealed class HttpRequestResiliencePipeline
 {
     private static readonly TimeSpan PollyMinimumCircuitDuration = TimeSpan.FromMilliseconds(500) + TimeSpan.FromTicks(1);
+    private static readonly TimeSpan PollyMaximumCircuitDuration = TimeSpan.FromDays(1);
     private static readonly ResiliencePropertyKey<ExecutionState> ExecutionStateKey = new("HttpRequestExecutionState");
 
     private readonly string _name;
@@ -78,11 +80,12 @@ public sealed class HttpRequestResiliencePipeline
         {
             FailureRatio = _options.CircuitFailureRatio,
             MinimumThroughput = _options.CircuitMinimumThroughput,
-            SamplingDuration = circuitTimeProvider.Scale(_options.CircuitSamplingDuration),
-            BreakDuration = circuitTimeProvider.Scale(_options.CircuitBreakDuration),
+            SamplingDuration = circuitTimeProvider.PollySamplingDuration,
+            BreakDuration = circuitTimeProvider.PollyBreakDuration,
             ShouldHandle = args => ValueTask.FromResult(TryClassify(args.Outcome, args.Context.CancellationToken, out _)),
             OnOpened = async args =>
             {
+                circuitTimeProvider.EnterOpenState();
                 Volatile.Write(ref _circuitOpenedTimestamp, _options.TimeProvider.GetTimestamp());
                 var category = TryClassify(args.Outcome, args.Context.CancellationToken, out var classified)
                     ? classified
@@ -95,20 +98,28 @@ public sealed class HttpRequestResiliencePipeline
                         category),
                     args.Context.CancellationToken).ConfigureAwait(false);
             },
-            OnHalfOpened = args => InvokeCircuitCallbackSafelyAsync(
-                new HttpCircuitTelemetry(
-                    _name,
-                    HttpResilienceCircuitState.HalfOpen,
-                    null,
-                    HttpResilienceFailureCategory.CircuitOpen),
-                args.Context.CancellationToken),
-            OnClosed = args => InvokeCircuitCallbackSafelyAsync(
-                new HttpCircuitTelemetry(
-                    _name,
-                    HttpResilienceCircuitState.Closed,
-                    args.Outcome.Result?.Response.StatusCode,
-                    ClassifyForTelemetry(args.Outcome, args.Context.CancellationToken)),
-                args.Context.CancellationToken),
+            OnHalfOpened = async args =>
+            {
+                circuitTimeProvider.EnterSamplingState();
+                await InvokeCircuitCallbackSafelyAsync(
+                    new HttpCircuitTelemetry(
+                        _name,
+                        HttpResilienceCircuitState.HalfOpen,
+                        null,
+                        HttpResilienceFailureCategory.CircuitOpen),
+                    args.Context.CancellationToken).ConfigureAwait(false);
+            },
+            OnClosed = async args =>
+            {
+                circuitTimeProvider.EnterSamplingState();
+                await InvokeCircuitCallbackSafelyAsync(
+                    new HttpCircuitTelemetry(
+                        _name,
+                        HttpResilienceCircuitState.Closed,
+                        args.Outcome.Result?.Response.StatusCode,
+                        ClassifyForTelemetry(args.Outcome, args.Context.CancellationToken)),
+                    args.Context.CancellationToken).ConfigureAwait(false);
+            },
         });
 
         builder.AddPipeline(retryPipeline);
@@ -395,16 +406,27 @@ public sealed class HttpRequestResiliencePipeline
 
     private sealed class CircuitTimeProvider : TimeProvider
     {
+        private readonly object _gate = new();
         private readonly TimeProvider _inner;
-        private readonly double _scale;
-        private readonly long _startTimestamp;
+        private readonly TimeScale _samplingScale;
+        private readonly TimeScale _openScale;
         private readonly DateTimeOffset _startUtc;
+        private long _actualAnchorTimestamp;
+        private long _virtualAnchorTicks;
+        private TimeScale _currentScale;
 
-        private CircuitTimeProvider(TimeProvider inner, double scale)
+        private CircuitTimeProvider(
+            TimeProvider inner,
+            TimeSpan samplingDuration,
+            TimeSpan breakDuration)
         {
             _inner = inner;
-            _scale = scale;
-            _startTimestamp = inner.GetTimestamp();
+            PollySamplingDuration = ClampForPolly(samplingDuration);
+            PollyBreakDuration = ClampForPolly(breakDuration);
+            _samplingScale = new TimeScale(PollySamplingDuration.Ticks, samplingDuration.Ticks);
+            _openScale = new TimeScale(PollyBreakDuration.Ticks, breakDuration.Ticks);
+            _currentScale = _samplingScale;
+            _actualAnchorTimestamp = inner.GetTimestamp();
             _startUtc = inner.GetUtcNow();
         }
 
@@ -412,39 +434,46 @@ public sealed class HttpRequestResiliencePipeline
 
         public override long TimestampFrequency => TimeSpan.TicksPerSecond;
 
+        public TimeSpan PollySamplingDuration { get; }
+
+        public TimeSpan PollyBreakDuration { get; }
+
         public static CircuitTimeProvider Create(
             TimeProvider inner,
             TimeSpan samplingDuration,
             TimeSpan breakDuration)
+            => new(inner, samplingDuration, breakDuration);
+
+        public void EnterOpenState()
         {
-            var shortestConfiguredDuration = Math.Min(samplingDuration.Ticks, breakDuration.Ticks);
-            var scale = Math.Max(1, PollyMinimumCircuitDuration.Ticks / (double)shortestConfiguredDuration);
-            return new CircuitTimeProvider(inner, scale);
+            lock (_gate)
+            {
+                SwitchScale(_openScale);
+            }
         }
 
-        public TimeSpan Scale(TimeSpan duration)
+        public void EnterSamplingState()
         {
-            if (_scale == 1)
+            lock (_gate)
             {
-                return duration;
+                SwitchScale(_samplingScale);
             }
-
-            var scaledTicks = Math.Ceiling(duration.Ticks * _scale);
-            return scaledTicks >= TimeSpan.MaxValue.Ticks
-                ? TimeSpan.MaxValue
-                : TimeSpan.FromTicks((long)scaledTicks);
         }
 
         public override DateTimeOffset GetUtcNow()
         {
-            var elapsed = _inner.GetElapsedTime(_startTimestamp);
-            var scaledElapsed = Scale(elapsed);
+            var scaledElapsed = TimeSpan.FromTicks(GetTimestamp());
             var maximumElapsed = DateTimeOffset.MaxValue - _startUtc;
             return _startUtc + (scaledElapsed <= maximumElapsed ? scaledElapsed : maximumElapsed);
         }
 
         public override long GetTimestamp()
-            => Scale(_inner.GetElapsedTime(_startTimestamp)).Ticks;
+        {
+            lock (_gate)
+            {
+                return GetTimestampCore();
+            }
+        }
 
         public override ITimer CreateTimer(
             TimerCallback callback,
@@ -454,20 +483,72 @@ public sealed class HttpRequestResiliencePipeline
             => _inner.CreateTimer(
                 callback,
                 state,
-                Unscale(dueTime),
-                Unscale(period));
+                ToCallerDuration(dueTime),
+                ToCallerDuration(period));
 
-        private TimeSpan Unscale(TimeSpan duration)
+        private static TimeSpan ClampForPolly(TimeSpan duration)
+            => duration < PollyMinimumCircuitDuration
+                ? PollyMinimumCircuitDuration
+                : duration > PollyMaximumCircuitDuration
+                    ? PollyMaximumCircuitDuration
+                    : duration;
+
+        private long GetTimestampCore()
         {
-            if (duration == Timeout.InfiniteTimeSpan || _scale == 1)
+            var actualElapsed = _inner.GetElapsedTime(_actualAnchorTimestamp);
+            var scaledTicks = _currentScale.ToPollyTicks(actualElapsed.Ticks);
+            var remainingTicks = TimeSpan.MaxValue.Ticks - _virtualAnchorTicks;
+            return scaledTicks >= remainingTicks
+                ? TimeSpan.MaxValue.Ticks
+                : _virtualAnchorTicks + scaledTicks;
+        }
+
+        private void SwitchScale(TimeScale scale)
+        {
+            var timestamp = GetTimestampCore();
+            _actualAnchorTimestamp = _inner.GetTimestamp();
+            _virtualAnchorTicks = timestamp;
+            _currentScale = scale;
+        }
+
+        private TimeSpan ToCallerDuration(TimeSpan duration)
+        {
+            if (duration == Timeout.InfiniteTimeSpan)
             {
                 return duration;
             }
 
-            var unscaledTicks = Math.Ceiling(duration.Ticks / _scale);
+            TimeScale currentScale;
+            lock (_gate)
+            {
+                currentScale = _currentScale;
+            }
+
+            var unscaledTicks = currentScale.ToCallerTicks(duration.Ticks);
             return duration > TimeSpan.Zero && unscaledTicks < 1
                 ? TimeSpan.FromTicks(1)
-                : TimeSpan.FromTicks((long)unscaledTicks);
+                : TimeSpan.FromTicks(unscaledTicks);
+        }
+
+        private readonly record struct TimeScale(long PollyTicks, long CallerTicks)
+        {
+            public long ToPollyTicks(long callerTicks)
+            {
+                var ticks = (BigInteger)callerTicks * PollyTicks / CallerTicks;
+                return ticks >= TimeSpan.MaxValue.Ticks ? TimeSpan.MaxValue.Ticks : (long)ticks;
+            }
+
+            public long ToCallerTicks(long pollyTicks)
+            {
+                var dividend = (BigInteger)pollyTicks * CallerTicks;
+                var ticks = BigInteger.DivRem(dividend, PollyTicks, out var remainder);
+                if (!remainder.IsZero)
+                {
+                    ticks++;
+                }
+
+                return ticks >= TimeSpan.MaxValue.Ticks ? TimeSpan.MaxValue.Ticks : (long)ticks;
+            }
         }
     }
 
