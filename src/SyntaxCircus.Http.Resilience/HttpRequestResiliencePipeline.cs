@@ -172,17 +172,17 @@ public sealed class HttpRequestResiliencePipeline
                 return await MapTerminalExceptionAsync(exception, circuitEntry, budget, cancellationToken).ConfigureAwait(false);
             }
 
-            var transition = _circuitBreaker.Complete(
+            var completion = _circuitBreaker.Complete(
                 circuitEntry,
-                ClassifyCircuitOutcome(result.Response, exception: null));
-            await InvokeCircuitCallbackSafelyAsync(transition, cancellationToken).ConfigureAwait(false);
-
-            if (cancellationToken.IsCancellationRequested)
+                ClassifyCircuitOutcome(result.Response, exception: null),
+                cancellationToken);
+            if (completion.CancellationWon)
             {
                 result.DisposeForTerminal();
                 ThrowCallerCancellation(cancellationToken);
             }
 
+            await InvokeCircuitCallbackSafelyAsync(completion.Transition, cancellationToken).ConfigureAwait(false);
             state.ReleaseResponse(result.Response);
             return result.Response;
         }
@@ -222,16 +222,16 @@ public sealed class HttpRequestResiliencePipeline
             ExceptionDispatchInfo.Capture(observerException.InnerException!).Throw();
         }
 
-        var transition = _circuitBreaker.Complete(
+        var completion = _circuitBreaker.Complete(
             circuitEntry,
-            ClassifyCircuitOutcome(response: null, exception));
-        await InvokeCircuitCallbackSafelyAsync(transition, cancellationToken).ConfigureAwait(false);
-
-        if (cancellationToken.IsCancellationRequested)
+            ClassifyCircuitOutcome(response: null, exception),
+            cancellationToken);
+        if (completion.CancellationWon)
         {
             ThrowCallerCancellation(cancellationToken, exception);
         }
 
+        await InvokeCircuitCallbackSafelyAsync(completion.Transition, cancellationToken).ConfigureAwait(false);
         ExceptionDispatchInfo.Capture(exception).Throw();
         throw new InvalidOperationException("Unreachable exception mapping path.");
     }
@@ -254,17 +254,19 @@ public sealed class HttpRequestResiliencePipeline
                 _options.TotalRequestTimeout),
             cancellationToken).ConfigureAwait(false);
 
-        if (cancellationToken.IsCancellationRequested)
-        {
-            _circuitBreaker.Exclude(circuitEntry);
-            ThrowCallerCancellation(cancellationToken, innerException);
-        }
-
         var timeoutOutcome = ClassifyCircuitOutcome(
             response: null,
             new LogicalTimeoutException(innerException));
-        var transition = _circuitBreaker.Complete(circuitEntry, timeoutOutcome);
-        await InvokeCircuitCallbackSafelyAsync(transition, cancellationToken).ConfigureAwait(false);
+        var completion = _circuitBreaker.Complete(
+            circuitEntry,
+            timeoutOutcome,
+            cancellationToken);
+        if (completion.CancellationWon)
+        {
+            ThrowCallerCancellation(cancellationToken, innerException);
+        }
+
+        await InvokeCircuitCallbackSafelyAsync(completion.Transition, cancellationToken).ConfigureAwait(false);
 
         throw new HttpRequestTimeoutException(_name, _options.TotalRequestTimeout, innerException);
     }
@@ -480,8 +482,15 @@ public sealed class HttpRequestResiliencePipeline
                 Task<HttpResponseMessage> senderTask;
                 try
                 {
-                    senderTask = sender(request, completionOption, cancellationToken)
-                        ?? throw new InvalidOperationException("The sender returned null task.");
+                    senderTask = Task.Run(
+                        async () =>
+                        {
+                            var work = sender(request, completionOption, cancellationToken)
+                                ?? throw new InvalidOperationException("The sender returned null task.");
+                            return await work.ConfigureAwait(false)
+                                ?? throw new InvalidOperationException("The sender returned null.");
+                        },
+                        CancellationToken.None);
                 }
                 catch (Exception exception)
                 {
@@ -502,8 +511,7 @@ public sealed class HttpRequestResiliencePipeline
 
                 try
                 {
-                    response = await senderTask.ConfigureAwait(false)
-                        ?? throw new InvalidOperationException("The sender returned null.");
+                    response = await senderTask.ConfigureAwait(false);
                 }
                 catch (Exception exception)
                 {
@@ -521,10 +529,12 @@ public sealed class HttpRequestResiliencePipeline
 
                 if (responseObserver is not null)
                 {
-                    ValueTask observerWork;
+                    Task observerTask;
                     try
                     {
-                        observerWork = responseObserver(response!, cancellationToken);
+                        observerTask = Task.Run(
+                            async () => await responseObserver(response!, cancellationToken).ConfigureAwait(false),
+                            CancellationToken.None);
                     }
                     catch (Exception exception)
                     {
@@ -532,9 +542,8 @@ public sealed class HttpRequestResiliencePipeline
                         throw new ResponseObserverException(exception);
                     }
 
-                    if (!observerWork.IsCompleted)
+                    if (!observerTask.IsCompleted)
                     {
-                        var observerTask = observerWork.AsTask();
                         var completed = await Task.WhenAny(observerTask, Budget.SignalTask).ConfigureAwait(false);
                         if (completed != observerTask)
                         {
@@ -543,28 +552,16 @@ public sealed class HttpRequestResiliencePipeline
                             request = null;
                             Budget.ThrowIfTerminal();
                         }
-
-                        try
-                        {
-                            await observerTask.ConfigureAwait(false);
-                        }
-                        catch (Exception exception)
-                        {
-                            Budget.ThrowIfTerminal(exception);
-                            throw new ResponseObserverException(exception);
-                        }
                     }
-                    else
+
+                    try
                     {
-                        try
-                        {
-                            await observerWork.ConfigureAwait(false);
-                        }
-                        catch (Exception exception)
-                        {
-                            Budget.ThrowIfTerminal(exception);
-                            throw new ResponseObserverException(exception);
-                        }
+                        await observerTask.ConfigureAwait(false);
+                    }
+                    catch (Exception exception)
+                    {
+                        Budget.ThrowIfTerminal(exception);
+                        throw new ResponseObserverException(exception);
                     }
                 }
 
@@ -597,10 +594,13 @@ public sealed class HttpRequestResiliencePipeline
             int attemptNumber,
             CancellationToken cancellationToken)
         {
-            ValueTask<HttpRequestMessage> factoryWork;
+            Task<HttpRequestMessage> factoryTask;
             try
             {
-                factoryWork = requestFactory(attemptNumber, cancellationToken);
+                factoryTask = Task.Run(
+                    async () => await requestFactory(attemptNumber, cancellationToken).ConfigureAwait(false)
+                        ?? throw new InvalidOperationException("The request factory returned null."),
+                    CancellationToken.None);
             }
             catch (Exception exception)
             {
@@ -608,9 +608,8 @@ public sealed class HttpRequestResiliencePipeline
                 throw;
             }
 
-            if (!factoryWork.IsCompleted)
+            if (!factoryTask.IsCompleted)
             {
-                var factoryTask = factoryWork.AsTask();
                 var completed = await Task.WhenAny(factoryTask, Budget.SignalTask).ConfigureAwait(false);
                 if (completed != factoryTask)
                 {
@@ -639,7 +638,7 @@ public sealed class HttpRequestResiliencePipeline
 
             try
             {
-                var request = await factoryWork.ConfigureAwait(false)
+                var request = await factoryTask.ConfigureAwait(false)
                     ?? throw new InvalidOperationException("The request factory returned null.");
                 if (Budget.HasTerminalOutcome)
                 {
@@ -971,45 +970,72 @@ public sealed class HttpRequestResiliencePipeline
             }
         }
 
-        public HttpCircuitTelemetry? Complete(CircuitEntry entry, CircuitOutcome outcome)
+        public CircuitCompletion Complete(
+            CircuitEntry entry,
+            CircuitOutcome outcome,
+            CancellationToken cancellationToken)
         {
             if (!entry.IsAdmitted)
             {
-                return null;
+                return CircuitCompletion.Committed(transition: null);
             }
 
             lock (_gate)
             {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    ExcludeCore(entry);
+                    return CircuitCompletion.Canceled;
+                }
+
                 if (entry.IsProbe)
                 {
                     if (_state != CircuitState.HalfOpen || entry.Generation != _generation)
                     {
-                        return null;
+                        return CircuitCompletion.Committed(transition: null);
+                    }
+
+                    if (outcome.IsFailure)
+                    {
+                        var probeTimestamp = _options.TimeProvider.GetTimestamp();
+                        // The provider is injected and may cancel the caller while producing the timestamp.
+                        // This check is the terminal linearization point: cancellation before it excludes
+                        // the outcome; cancellation after the committed mutation is post-terminal.
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            ExcludeCore(entry);
+                            return CircuitCompletion.Canceled;
+                        }
+
+                        _halfOpenProbeActive = false;
+                        return CircuitCompletion.Committed(OpenCircuit(probeTimestamp, outcome));
                     }
 
                     _halfOpenProbeActive = false;
-                    if (outcome.IsFailure)
-                    {
-                        return OpenCircuit(_options.TimeProvider.GetTimestamp(), outcome);
-                    }
-
                     _state = CircuitState.Closed;
                     _generation++;
                     _samples.Clear();
                     _failureCount = 0;
-                    return new HttpCircuitTelemetry(
+                    return CircuitCompletion.Committed(new HttpCircuitTelemetry(
                         _name,
                         HttpResilienceCircuitState.Closed,
                         outcome.StatusCode,
-                        outcome.Category);
+                        outcome.Category));
                 }
 
                 if (_state != CircuitState.Closed || entry.Generation != _generation)
                 {
-                    return null;
+                    return CircuitCompletion.Committed(transition: null);
                 }
 
                 var now = _options.TimeProvider.GetTimestamp();
+                // Keep cancellation selection and sample/state mutation in the same critical section.
+                // No callback runs under this lock, so a post-commit callback cannot require rollback.
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return CircuitCompletion.Canceled;
+                }
+
                 Prune(now);
                 _samples.Enqueue(new CircuitSample(now, outcome.IsFailure));
                 if (outcome.IsFailure)
@@ -1021,10 +1047,10 @@ public sealed class HttpRequestResiliencePipeline
                     || _samples.Count < _options.CircuitMinimumThroughput
                     || (double)_failureCount / _samples.Count < _options.CircuitFailureRatio)
                 {
-                    return null;
+                    return CircuitCompletion.Committed(transition: null);
                 }
 
-                return OpenCircuit(now, outcome);
+                return CircuitCompletion.Committed(OpenCircuit(now, outcome));
             }
         }
 
@@ -1037,10 +1063,15 @@ public sealed class HttpRequestResiliencePipeline
 
             lock (_gate)
             {
-                if (_state == CircuitState.HalfOpen && entry.Generation == _generation)
-                {
-                    _halfOpenProbeActive = false;
-                }
+                ExcludeCore(entry);
+            }
+        }
+
+        private void ExcludeCore(CircuitEntry entry)
+        {
+            if (entry.IsProbe && _state == CircuitState.HalfOpen && entry.Generation == _generation)
+            {
+                _halfOpenProbeActive = false;
             }
         }
 
@@ -1101,6 +1132,16 @@ public sealed class HttpRequestResiliencePipeline
         bool IsFailure,
         HttpStatusCode? StatusCode,
         HttpResilienceFailureCategory Category);
+
+    private readonly record struct CircuitCompletion(
+        bool CancellationWon,
+        HttpCircuitTelemetry? Transition)
+    {
+        public static CircuitCompletion Canceled => new(true, null);
+
+        public static CircuitCompletion Committed(HttpCircuitTelemetry? transition)
+            => new(false, transition);
+    }
 
     private readonly record struct CircuitSample(long Timestamp, bool IsFailure);
 

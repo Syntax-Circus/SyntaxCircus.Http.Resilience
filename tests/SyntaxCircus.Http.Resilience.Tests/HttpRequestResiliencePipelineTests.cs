@@ -1287,7 +1287,7 @@ public class HttpRequestResiliencePipelineTests
 
     private static async Task WaitForTimerCountAsync(ManualTimeProvider timeProvider, int count)
     {
-        for (var i = 0; i < 100 && timeProvider.ActiveTimerCount < count; i++)
+        for (var i = 0; i < 10_000 && timeProvider.ActiveTimerCount < count; i++)
         {
             await Task.Yield();
         }
