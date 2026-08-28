@@ -10,7 +10,7 @@ public static class ResilientHttpClientExtensions
 {
     /// <summary>
     /// Registers a named <see cref="HttpClient"/> with retry + circuit-breaker resilience
-    /// (exponential backoff with jitter, retrying transient errors and 429/5xx).
+    /// (exponential backoff with jitter, retrying transport/timeouts and the shared transient HTTP status set).
     /// <paramref name="aiMode"/> excludes 429 (rate-limited) from retry/circuit-breaking — useful
     /// for AI/LLM provider clients, where a 429 means "back off on purpose", not "something's broken".
     /// </summary>
@@ -47,7 +47,10 @@ public static class ResilientHttpClientExtensions
                 MaxRetryAttempts = retryCount,
                 BackoffType = DelayBackoffType.Exponential,
                 UseJitter = true,
-                ShouldHandle = args => ValueTask.FromResult(ShouldHandle(args.Outcome, aiMode)),
+                ShouldHandle = args => ValueTask.FromResult(HttpResilienceOutcomeClassifier.ShouldHandle(
+                    args.Outcome,
+                    includeTooManyRequests: !aiMode,
+                    args.Context.CancellationToken)),
                 OnRetry = args =>
                 {
                     onRetry?.Invoke(name, args.AttemptNumber + 1, args.Outcome.Result?.StatusCode);
@@ -60,7 +63,10 @@ public static class ResilientHttpClientExtensions
                 FailureRatio = 0.5,
                 MinimumThroughput = 5,
                 BreakDuration = TimeSpan.FromSeconds(30),
-                ShouldHandle = args => ValueTask.FromResult(ShouldHandle(args.Outcome, aiMode)),
+                ShouldHandle = args => ValueTask.FromResult(HttpResilienceOutcomeClassifier.ShouldHandle(
+                    args.Outcome,
+                    includeTooManyRequests: !aiMode,
+                    args.Context.CancellationToken)),
                 OnOpened = args =>
                 {
                     onBreak?.Invoke(name, args.Outcome.Result?.StatusCode);
@@ -71,25 +77,51 @@ public static class ResilientHttpClientExtensions
 
         return builder;
     }
+}
 
-    private static bool ShouldHandle(Outcome<HttpResponseMessage> outcome, bool aiMode)
+internal static class HttpResilienceOutcomeClassifier
+{
+    public static bool ShouldHandle(
+        Outcome<HttpResponseMessage> outcome,
+        bool includeTooManyRequests,
+        CancellationToken cancellationToken)
+        => TryClassify(
+            outcome.Result,
+            outcome.Exception,
+            includeTooManyRequests,
+            cancellationToken,
+            out _);
+
+    public static bool TryClassify(
+        HttpResponseMessage? response,
+        Exception? exception,
+        bool includeTooManyRequests,
+        CancellationToken cancellationToken,
+        out HttpResilienceFailureCategory category)
     {
-        if (outcome.Exception is not null)
+        if (exception is HttpRequestException)
         {
+            category = HttpResilienceFailureCategory.Transport;
             return true;
         }
 
-        var statusCode = outcome.Result?.StatusCode;
-        if (statusCode is null)
+        if (exception is TimeoutException
+            || exception is OperationCanceledException && !cancellationToken.IsCancellationRequested)
         {
-            return false;
+            category = HttpResilienceFailureCategory.Timeout;
+            return true;
         }
 
-        if (statusCode == HttpStatusCode.TooManyRequests)
+        category = HttpResilienceFailureCategory.HttpStatus;
+        return response?.StatusCode switch
         {
-            return !aiMode;
-        }
-
-        return (int)statusCode >= 500;
+            HttpStatusCode.RequestTimeout => true,
+            HttpStatusCode.TooManyRequests => includeTooManyRequests,
+            HttpStatusCode.InternalServerError => true,
+            HttpStatusCode.BadGateway => true,
+            HttpStatusCode.ServiceUnavailable => true,
+            HttpStatusCode.GatewayTimeout => true,
+            _ => false,
+        };
     }
 }
