@@ -683,7 +683,14 @@ public sealed class HttpRequestResiliencePipeline
                         {
                             try
                             {
-                                await responseObserver(response, Budget.ExecutionToken).ConfigureAwait(false);
+                                // The sender await may resume inline on its completion thread.
+                                // Queue observer work before any user code can run on that thread.
+                                var scheduledResponse = response;
+                                await Task.Run(
+                                    async () => await responseObserver(
+                                        scheduledResponse,
+                                        Budget.ExecutionToken).ConfigureAwait(false),
+                                    CancellationToken.None).ConfigureAwait(false);
                             }
                             catch
                             {
