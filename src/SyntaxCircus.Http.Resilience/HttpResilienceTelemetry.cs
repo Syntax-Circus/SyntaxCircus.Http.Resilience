@@ -30,6 +30,11 @@ public sealed record HttpRetryTelemetry(
     HttpResilienceFailureCategory FailureCategory,
     TimeSpan Delay);
 
+public sealed record HttpTimeoutTelemetry(
+    string PipelineName,
+    HttpResilienceFailureCategory FailureCategory,
+    TimeSpan Timeout);
+
 public sealed record HttpCircuitTelemetry(
     string PipelineName,
     HttpResilienceCircuitState State,

@@ -76,6 +76,29 @@ var pipeline = new HttpRequestResiliencePipeline(
         TotalRequestTimeout = TimeSpan.FromSeconds(30),
         BackoffBaseDelay = TimeSpan.FromMilliseconds(100),
         MaximumDelay = TimeSpan.FromSeconds(5),
+        RetryableStatusCodes = new HashSet<HttpStatusCode>
+        {
+            HttpStatusCode.RequestTimeout,
+            HttpStatusCode.TooManyRequests,
+            HttpStatusCode.InternalServerError,
+            HttpStatusCode.BadGateway,
+            HttpStatusCode.ServiceUnavailable,
+            HttpStatusCode.GatewayTimeout,
+        },
+        RetryableExceptionCategories = new HashSet<HttpResilienceFailureCategory>
+        {
+            HttpResilienceFailureCategory.Transport,
+            HttpResilienceFailureCategory.Timeout,
+        },
+        OnTimeout = (telemetry, cancellationToken) =>
+        {
+            logger.LogWarning(
+                "Pipeline {PipelineName} exhausted its {Timeout} budget ({FailureCategory})",
+                telemetry.PipelineName,
+                telemetry.Timeout,
+                telemetry.FailureCategory);
+            return ValueTask.CompletedTask;
+        },
     });
 
 using var response = await pipeline.SendAsync(
@@ -112,7 +135,9 @@ using var response = await pipeline.SendAsync(
 
 Every attempt needs a **fresh request factory**: the pipeline disposes each request after its send, so never return a reused `HttpRequestMessage`. Mark an operation `Replayable` only when repeating it is safe; `NotReplayable` sends at most once. The returned final response belongs to the caller and must be disposed. A caller cancellation remains an `OperationCanceledException`; exhausting `TotalRequestTimeout` throws `HttpRequestTimeoutException`; an open circuit throws `HttpCircuitOpenException`.
 
-`OnRetry` and `OnCircuitStateChanged` receive retry/circuit telemetry. Callback failures are non-fatal and never replace the request outcome. Keyed registration validates and snapshots the supplied immutable `HttpRequestResilienceOptions` as it creates the singleton. It intentionally adds neither a `DelegatingHandler` nor an `HttpClient`: migrate selected manual request paths to this API while retaining `AddResilientHttpClient` for existing `HttpClientFactory` registrations.
+`RetryableStatusCodes` defaults to 408, 429, 500, 502, 503, and 504. `RetryableExceptionCategories` defaults to `Transport` and `Timeout`; only those two exception categories are valid configuration values. Retry and circuit classification share these sets, and each pipeline snapshots them during construction so later collection mutation cannot change a live policy.
+
+`OnRetry`, `OnTimeout`, and `OnCircuitStateChanged` receive bounded retry, logical-budget timeout, and circuit telemetry. A timeout event contains only the pipeline name, `Timeout` failure category, and configured total budget. Callback failures are non-fatal and never replace success, timeout, caller cancellation, or another request outcome. Keyed registration validates and snapshots the supplied `HttpRequestResilienceOptions` as it creates the singleton. It intentionally adds neither a `DelegatingHandler` nor an `HttpClient`: migrate selected manual request paths to this API while retaining `AddResilientHttpClient` for existing `HttpClientFactory` registrations.
 
 ## CachedTokenProvider
 

@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using System.Net.Http;
 using System.Numerics;
 using System.Runtime.ExceptionServices;
@@ -40,7 +41,10 @@ public sealed class HttpRequestResiliencePipeline
             CircuitBreakDuration = options.CircuitBreakDuration,
             TimeProvider = options.TimeProvider,
             JitterProvider = options.JitterProvider,
+            RetryableStatusCodes = options.RetryableStatusCodes.ToFrozenSet(),
+            RetryableExceptionCategories = options.RetryableExceptionCategories.ToFrozenSet(),
             OnRetry = options.OnRetry,
+            OnTimeout = options.OnTimeout,
             OnCircuitStateChanged = options.OnCircuitStateChanged,
         };
 
@@ -204,22 +208,28 @@ public sealed class HttpRequestResiliencePipeline
         }
         catch (OperationCanceledException exception) when (cancellationToken.IsCancellationRequested)
         {
-            state.DisposePendingResponse();
+            state.DisposePendingResponseBestEffort();
             throw new OperationCanceledException(exception.Message, exception, cancellationToken);
         }
         catch (OperationCanceledException exception) when (timeoutSource?.IsCancellationRequested == true)
         {
-            state.DisposePendingResponse();
+            state.DisposePendingResponseBestEffort();
+            await InvokeTimeoutCallbackSafelyAsync(
+                new HttpTimeoutTelemetry(
+                    _name,
+                    HttpResilienceFailureCategory.Timeout,
+                    _options.TotalRequestTimeout),
+                cancellationToken).ConfigureAwait(false);
             throw new HttpRequestTimeoutException(_name, _options.TotalRequestTimeout, exception);
         }
         catch (BrokenCircuitException exception)
         {
-            state.DisposePendingResponse();
+            state.DisposePendingResponseBestEffort();
             throw new HttpCircuitOpenException(_name, GetCircuitRetryAfter(), exception);
         }
         catch
         {
-            state.DisposePendingResponse();
+            state.DisposePendingResponseBestEffort();
             throw;
         }
         finally
@@ -307,18 +317,19 @@ public sealed class HttpRequestResiliencePipeline
             ? state
             : throw new InvalidOperationException("The request execution state is unavailable.");
 
-    private static bool TryClassify(
+    private bool TryClassify(
         Outcome<AttemptResult> outcome,
         CancellationToken cancellationToken,
         out HttpResilienceFailureCategory category)
         => HttpResilienceOutcomeClassifier.TryClassify(
             outcome.Result?.Response,
             outcome.Exception,
-            includeTooManyRequests: true,
+            _options.RetryableStatusCodes,
+            _options.RetryableExceptionCategories,
             cancellationToken,
             out category);
 
-    private static HttpResilienceFailureCategory ClassifyForTelemetry(
+    private HttpResilienceFailureCategory ClassifyForTelemetry(
         Outcome<AttemptResult> outcome,
         CancellationToken cancellationToken)
         => TryClassify(outcome, cancellationToken, out var category)
@@ -363,14 +374,49 @@ public sealed class HttpRequestResiliencePipeline
         }
     }
 
+    private async ValueTask InvokeTimeoutCallbackSafelyAsync(
+        HttpTimeoutTelemetry telemetry,
+        CancellationToken cancellationToken)
+    {
+        if (_options.OnTimeout is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _options.OnTimeout(telemetry, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+        }
+    }
+
     private sealed class AttemptResult(HttpResponseMessage response, ExecutionState state)
     {
         public HttpResponseMessage Response { get; } = response;
 
         public void DisposeForRetry()
         {
-            Response.Dispose();
-            state.ReleaseResponse(Response);
+            try
+            {
+                DisposeBestEffort(Response);
+            }
+            finally
+            {
+                state.ReleaseResponse(Response);
+            }
+        }
+
+        private static void DisposeBestEffort(HttpResponseMessage disposable)
+        {
+            try
+            {
+                disposable.Dispose();
+            }
+            catch
+            {
+            }
         }
     }
 
@@ -392,10 +438,11 @@ public sealed class HttpRequestResiliencePipeline
         public async ValueTask<AttemptResult> SendAttemptAsync(CancellationToken cancellationToken)
         {
             var attemptNumber = Interlocked.Increment(ref _attemptNumber);
-            HttpRequestMessage? request = await requestFactory(attemptNumber, cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException("The request factory returned null.");
+            HttpRequestMessage? request = null;
             try
             {
+                request = await requestFactory(attemptNumber, cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("The request factory returned null.");
                 var response = await sender(request, completionOption, cancellationToken).ConfigureAwait(false)
                     ?? throw new InvalidOperationException("The sender returned null.");
                 Volatile.Write(ref _pendingResponse, response);
@@ -419,18 +466,13 @@ public sealed class HttpRequestResiliencePipeline
             }
             finally
             {
-                request?.Dispose();
+                DisposeBestEffort(request);
             }
         }
 
         public void ReleaseResponse(HttpResponseMessage response)
         {
             Interlocked.CompareExchange(ref _pendingResponse, null, response);
-        }
-
-        public void DisposePendingResponse()
-        {
-            Interlocked.Exchange(ref _pendingResponse, null)?.Dispose();
         }
 
         public void DisposePendingResponseBestEffort()
@@ -446,7 +488,7 @@ public sealed class HttpRequestResiliencePipeline
             }
             catch
             {
-                // Observer failures own the outcome; cleanup must not replace or classify them.
+                // The operation outcome owns the result; cleanup must never replace or classify it.
             }
         }
     }
@@ -632,6 +674,22 @@ public sealed class HttpRequestResiliencePipeline
 
         ArgumentNullException.ThrowIfNull(options.TimeProvider);
         ArgumentNullException.ThrowIfNull(options.JitterProvider);
+        ArgumentNullException.ThrowIfNull(options.RetryableStatusCodes);
+        ArgumentNullException.ThrowIfNull(options.RetryableExceptionCategories);
+
+        ValidateRetryableExceptionCategories(options.RetryableExceptionCategories);
+    }
+
+    private static void ValidateRetryableExceptionCategories(
+        IReadOnlySet<HttpResilienceFailureCategory> retryableExceptionCategories)
+    {
+        foreach (var category in retryableExceptionCategories)
+        {
+            if (category is not (HttpResilienceFailureCategory.Transport or HttpResilienceFailureCategory.Timeout))
+            {
+                throw new ArgumentOutOfRangeException(nameof(retryableExceptionCategories));
+            }
+        }
     }
 
     private static void ValidatePositive(TimeSpan value, string parameterName)

@@ -217,6 +217,108 @@ public class HttpRequestResiliencePipelineTests
     }
 
     [Fact]
+    public async Task SendAsync_CustomIncludedStatus_RetriesAndFeedsCircuitClassification()
+    {
+        var timeProvider = new ManualTimeProvider();
+        var circuitEvents = new List<HttpCircuitTelemetry>();
+        var sends = 0;
+        var pipeline = CreatePipeline(
+            timeProvider,
+            maxAttempts: 1,
+            circuitMinimumThroughput: 2,
+            retryableStatusCodes: new HashSet<HttpStatusCode> { HttpStatusCode.NotImplemented },
+            onCircuit: (telemetry, _) => { circuitEvents.Add(telemetry); return ValueTask.CompletedTask; });
+
+        for (var i = 0; i < 2; i++)
+        {
+            using var response = await SendAsync(pipeline, (_, _, _) =>
+                Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotImplemented)));
+        }
+
+        await Should.ThrowAsync<HttpCircuitOpenException>(() => SendAsync(pipeline, (_, _, _) =>
+        {
+            sends++;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+        }));
+
+        sends.ShouldBe(0);
+        circuitEvents.Single().FailureCategory.ShouldBe(HttpResilienceFailureCategory.HttpStatus);
+        circuitEvents.Single().StatusCode.ShouldBe(HttpStatusCode.NotImplemented);
+    }
+
+    [Fact]
+    public async Task SendAsync_CustomExcludedStatus_DoesNotRetryOrOpenCircuit()
+    {
+        var sends = 0;
+        var pipeline = CreatePipeline(
+            new ManualTimeProvider(),
+            maxAttempts: 2,
+            circuitMinimumThroughput: 2,
+            retryableStatusCodes: new HashSet<HttpStatusCode>());
+
+        for (var i = 0; i < 3; i++)
+        {
+            using var response = await SendAsync(pipeline, (_, _, _) =>
+            {
+                sends++;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
+            });
+        }
+
+        sends.ShouldBe(3);
+    }
+
+    [Fact]
+    public async Task SendAsync_ExcludedTransportCategory_DoesNotRetryOrOpenCircuit()
+    {
+        var sends = 0;
+        var pipeline = CreatePipeline(
+            new ManualTimeProvider(),
+            maxAttempts: 2,
+            circuitMinimumThroughput: 2,
+            retryableExceptionCategories: new HashSet<HttpResilienceFailureCategory> { HttpResilienceFailureCategory.Timeout });
+
+        for (var i = 0; i < 3; i++)
+        {
+            await Should.ThrowAsync<HttpRequestException>(() => SendAsync(pipeline, (_, _, _) =>
+            {
+                sends++;
+                return Task.FromException<HttpResponseMessage>(new HttpRequestException("excluded"));
+            }));
+        }
+
+        sends.ShouldBe(3);
+    }
+
+    [Fact]
+    public async Task SendAsync_ClassifierSetsAreSnapshottedAtConstruction()
+    {
+        var timeProvider = new ManualTimeProvider();
+        var statusCodes = new HashSet<HttpStatusCode> { HttpStatusCode.NotImplemented };
+        var categories = new HashSet<HttpResilienceFailureCategory> { HttpResilienceFailureCategory.Transport };
+        var sends = 0;
+        var pipeline = CreatePipeline(
+            timeProvider,
+            maxAttempts: 2,
+            retryableStatusCodes: statusCodes,
+            retryableExceptionCategories: categories);
+        statusCodes.Clear();
+        statusCodes.Add(HttpStatusCode.ServiceUnavailable);
+        categories.Clear();
+
+        var operation = SendAsync(pipeline, (_, _, _) => Task.FromResult(
+            ++sends == 1
+                ? new HttpResponseMessage(HttpStatusCode.NotImplemented)
+                : new HttpResponseMessage(HttpStatusCode.OK)));
+
+        await AdvanceRetryAsync(operation, timeProvider, TimeSpan.FromSeconds(1));
+        using var response = await operation;
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        sends.ShouldBe(2);
+    }
+
+    [Fact]
     public async Task SendAsync_NotReplayable_ReturnsFirstTransientResponse()
     {
         var sends = 0;
@@ -444,21 +546,155 @@ public class HttpRequestResiliencePipelineTests
     }
 
     [Fact]
+    public async Task SendAsync_LogicalBudgetExpiryEmitsExactlyOneTimeoutEventWithExactFields()
+    {
+        var timeProvider = new ManualTimeProvider();
+        var events = new List<HttpTimeoutTelemetry>();
+        var pipeline = CreatePipeline(
+            timeProvider,
+            totalTimeout: TimeSpan.FromMilliseconds(500),
+            onTimeout: (telemetry, _) => { events.Add(telemetry); return ValueTask.CompletedTask; });
+        var operation = SendAsync(pipeline, (_, _, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)));
+
+        await WaitForTimerCountAsync(timeProvider, 2);
+        timeProvider.Advance(TimeSpan.FromMilliseconds(500));
+
+        await Should.ThrowAsync<HttpRequestTimeoutException>(() => operation);
+        events.ShouldBe([
+            new HttpTimeoutTelemetry(
+                "test",
+                HttpResilienceFailureCategory.Timeout,
+                TimeSpan.FromMilliseconds(500)),
+        ]);
+    }
+
+    [Fact]
+    public async Task SendAsync_ThrowingTimeoutCallbackDoesNotReplaceTimeoutOrCallerCancellation()
+    {
+        var callbackCount = 0;
+        ValueTask ThrowingTimeout(HttpTimeoutTelemetry _, CancellationToken __)
+        {
+            callbackCount++;
+            return ValueTask.FromException(new InvalidOperationException("telemetry"));
+        }
+
+        var timeProvider = new ManualTimeProvider();
+        var pipeline = CreatePipeline(
+            timeProvider,
+            totalTimeout: TimeSpan.FromMilliseconds(500),
+            onTimeout: ThrowingTimeout);
+        var timeoutOperation = SendAsync(pipeline, (_, _, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)));
+        await WaitForTimerCountAsync(timeProvider, 2);
+        timeProvider.Advance(TimeSpan.FromMilliseconds(500));
+        await Should.ThrowAsync<HttpRequestTimeoutException>(() => timeoutOperation);
+
+        using var cancellation = new CancellationTokenSource();
+        var callerException = new OperationCanceledException("caller", cancellation.Token);
+        var actual = await Should.ThrowAsync<OperationCanceledException>(() => SendAsyncWithCancellation(
+            pipeline,
+            (_, _, _) =>
+            {
+                cancellation.Cancel();
+                return Task.FromException<HttpResponseMessage>(callerException);
+            },
+            cancellation.Token));
+
+        actual.CancellationToken.ShouldBe(cancellation.Token);
+        callbackCount.ShouldBe(1);
+    }
+
+    [Fact]
     public async Task SendAsync_CallerCancellationPreservesCallerTokenAndDoesNotRetry()
     {
         using var cancellation = new CancellationTokenSource();
         var sends = 0;
         var pipeline = CreatePipeline(new ManualTimeProvider());
 
+        var callerException = new OperationCanceledException("caller", cancellation.Token);
         var exception = await Should.ThrowAsync<OperationCanceledException>(() => SendAsyncWithCancellation(pipeline, (_, _, _) =>
         {
             sends++;
             cancellation.Cancel();
-            return Task.FromException<HttpResponseMessage>(new OperationCanceledException("caller", cancellation.Token));
+            return Task.FromException<HttpResponseMessage>(callerException);
         }, cancellation.Token));
 
         exception.CancellationToken.ShouldBe(cancellation.Token);
         sends.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task SendAsync_ThrowingRequestCleanupCannotReplaceCallerCancellationAndPipelineRemainsHealthy()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var callerException = new OperationCanceledException("caller", cancellation.Token);
+        var throwingContent = new ThrowingDisposeContent(new InvalidOperationException("request cleanup"));
+        var circuitEvents = new List<HttpCircuitTelemetry>();
+        var pipeline = CreatePipeline(
+            new ManualTimeProvider(),
+            circuitMinimumThroughput: 2,
+            onCircuit: (telemetry, _) => { circuitEvents.Add(telemetry); return ValueTask.CompletedTask; });
+
+        var actual = await Should.ThrowAsync<OperationCanceledException>(() => pipeline.SendAsync(
+            (_, _) => ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/cancel")
+            {
+                Content = throwingContent,
+            }),
+            (_, _, _) =>
+            {
+                cancellation.Cancel();
+                return Task.FromException<HttpResponseMessage>(callerException);
+            },
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            cancellationToken: cancellation.Token));
+
+        actual.CancellationToken.ShouldBe(cancellation.Token);
+        throwingContent.DisposeAttempted.ShouldBeTrue();
+        circuitEvents.ShouldBeEmpty();
+
+        using var response = await SendAsync(pipeline, (_, _, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)));
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        circuitEvents.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task SendAsync_ThrowingPendingResponseCleanupCannotReplaceCallerCancellationAndPipelineRemainsHealthy()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var callerException = new OperationCanceledException("caller", cancellation.Token);
+        var throwingContent = new ThrowingDisposeContent(new InvalidOperationException("response cleanup"));
+        var circuitEvents = new List<HttpCircuitTelemetry>();
+        var pipeline = CreatePipeline(
+            new ManualTimeProvider(),
+            circuitMinimumThroughput: 2,
+            onCircuit: (telemetry, _) => { circuitEvents.Add(telemetry); return ValueTask.CompletedTask; });
+
+        var actual = await Should.ThrowAsync<OperationCanceledException>(() => pipeline.SendAsync(
+            (_, _) => ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/cancel")),
+            (_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                {
+                    Content = throwingContent,
+                }),
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            (_, _) =>
+            {
+                cancellation.Cancel();
+                return ValueTask.FromException(callerException);
+            },
+            cancellation.Token));
+
+        actual.CancellationToken.ShouldBe(cancellation.Token);
+        throwingContent.DisposeAttempted.ShouldBeTrue();
+        circuitEvents.ShouldBeEmpty();
+
+        using var response = await SendAsync(pipeline, (_, _, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)));
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        circuitEvents.ShouldBeEmpty();
     }
 
     [Fact]
@@ -865,7 +1101,10 @@ public class HttpRequestResiliencePipelineTests
         TimeSpan? circuitSamplingDuration = null,
         TimeSpan? circuitBreakDuration = null,
         Func<double>? jitterProvider = null,
+        IReadOnlySet<HttpStatusCode>? retryableStatusCodes = null,
+        IReadOnlySet<HttpResilienceFailureCategory>? retryableExceptionCategories = null,
         Func<HttpRetryTelemetry, CancellationToken, ValueTask>? onRetry = null,
+        Func<HttpTimeoutTelemetry, CancellationToken, ValueTask>? onTimeout = null,
         Func<HttpCircuitTelemetry, CancellationToken, ValueTask>? onCircuit = null)
         => new("test", new HttpRequestResilienceOptions
         {
@@ -879,7 +1118,10 @@ public class HttpRequestResiliencePipelineTests
             CircuitBreakDuration = circuitBreakDuration ?? TimeSpan.FromSeconds(5),
             TimeProvider = timeProvider,
             JitterProvider = jitterProvider ?? (() => 0),
+            RetryableStatusCodes = retryableStatusCodes ?? new HttpRequestResilienceOptions().RetryableStatusCodes,
+            RetryableExceptionCategories = retryableExceptionCategories ?? new HttpRequestResilienceOptions().RetryableExceptionCategories,
             OnRetry = onRetry,
+            OnTimeout = onTimeout,
             OnCircuitStateChanged = onCircuit,
         });
 

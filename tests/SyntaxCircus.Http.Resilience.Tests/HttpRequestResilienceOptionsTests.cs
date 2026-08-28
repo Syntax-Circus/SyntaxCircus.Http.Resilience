@@ -1,3 +1,5 @@
+using System.Net;
+
 namespace SyntaxCircus.Http.Resilience.Tests;
 
 public class HttpRequestResilienceOptionsTests
@@ -17,7 +19,20 @@ public class HttpRequestResilienceOptionsTests
         options.CircuitBreakDuration.ShouldBe(TimeSpan.FromSeconds(30));
         options.TimeProvider.ShouldBeSameAs(TimeProvider.System);
         options.JitterProvider.ShouldNotBeNull();
+        options.RetryableStatusCodes.ShouldBe([
+            HttpStatusCode.RequestTimeout,
+            HttpStatusCode.TooManyRequests,
+            HttpStatusCode.InternalServerError,
+            HttpStatusCode.BadGateway,
+            HttpStatusCode.ServiceUnavailable,
+            HttpStatusCode.GatewayTimeout,
+        ], ignoreOrder: true);
+        options.RetryableExceptionCategories.ShouldBe([
+            HttpResilienceFailureCategory.Transport,
+            HttpResilienceFailureCategory.Timeout,
+        ], ignoreOrder: true);
         options.OnRetry.ShouldBeNull();
+        options.OnTimeout.ShouldBeNull();
         options.OnCircuitStateChanged.ShouldBeNull();
     }
 
@@ -144,6 +159,36 @@ public class HttpRequestResilienceOptionsTests
         var options = new HttpRequestResilienceOptions { JitterProvider = null! };
 
         Should.Throw<ArgumentNullException>(() => new HttpRequestResiliencePipeline("cmsify", options));
+    }
+
+    [Fact]
+    public void Constructor_RejectsNullRetryableStatusCodes()
+    {
+        var options = new HttpRequestResilienceOptions { RetryableStatusCodes = null! };
+
+        Should.Throw<ArgumentNullException>(() => new HttpRequestResiliencePipeline("cmsify", options));
+    }
+
+    [Fact]
+    public void Constructor_RejectsNullRetryableExceptionCategories()
+    {
+        var options = new HttpRequestResilienceOptions { RetryableExceptionCategories = null! };
+
+        Should.Throw<ArgumentNullException>(() => new HttpRequestResiliencePipeline("cmsify", options));
+    }
+
+    [Theory]
+    [InlineData(HttpResilienceFailureCategory.HttpStatus)]
+    [InlineData(HttpResilienceFailureCategory.CircuitOpen)]
+    [InlineData((HttpResilienceFailureCategory)999)]
+    public void Constructor_RejectsUnsupportedRetryableExceptionCategory(HttpResilienceFailureCategory category)
+    {
+        var options = new HttpRequestResilienceOptions
+        {
+            RetryableExceptionCategories = new HashSet<HttpResilienceFailureCategory> { category },
+        };
+
+        Should.Throw<ArgumentOutOfRangeException>(() => new HttpRequestResiliencePipeline("cmsify", options));
     }
 
     [Fact]

@@ -81,6 +81,11 @@ public static class ResilientHttpClientExtensions
 
 internal static class HttpResilienceOutcomeClassifier
 {
+    private static readonly IReadOnlySet<HttpStatusCode> RetryableStatusCodesWithoutTooManyRequests =
+        HttpRequestResilienceOptions.DefaultRetryableStatusCodes
+            .Where(statusCode => statusCode != HttpStatusCode.TooManyRequests)
+            .ToHashSet();
+
     public static bool ShouldHandle(
         Outcome<HttpResponseMessage> outcome,
         bool includeTooManyRequests,
@@ -88,40 +93,35 @@ internal static class HttpResilienceOutcomeClassifier
         => TryClassify(
             outcome.Result,
             outcome.Exception,
-            includeTooManyRequests,
+            includeTooManyRequests
+                ? HttpRequestResilienceOptions.DefaultRetryableStatusCodes
+                : RetryableStatusCodesWithoutTooManyRequests,
+            HttpRequestResilienceOptions.DefaultRetryableExceptionCategories,
             cancellationToken,
             out _);
 
     public static bool TryClassify(
         HttpResponseMessage? response,
         Exception? exception,
-        bool includeTooManyRequests,
+        IReadOnlySet<HttpStatusCode> retryableStatusCodes,
+        IReadOnlySet<HttpResilienceFailureCategory> retryableExceptionCategories,
         CancellationToken cancellationToken,
         out HttpResilienceFailureCategory category)
     {
         if (exception is HttpRequestException)
         {
             category = HttpResilienceFailureCategory.Transport;
-            return true;
+            return retryableExceptionCategories.Contains(category);
         }
 
         if (exception is TimeoutException
             || exception is OperationCanceledException && !cancellationToken.IsCancellationRequested)
         {
             category = HttpResilienceFailureCategory.Timeout;
-            return true;
+            return retryableExceptionCategories.Contains(category);
         }
 
         category = HttpResilienceFailureCategory.HttpStatus;
-        return response?.StatusCode switch
-        {
-            HttpStatusCode.RequestTimeout => true,
-            HttpStatusCode.TooManyRequests => includeTooManyRequests,
-            HttpStatusCode.InternalServerError => true,
-            HttpStatusCode.BadGateway => true,
-            HttpStatusCode.ServiceUnavailable => true,
-            HttpStatusCode.GatewayTimeout => true,
-            _ => false,
-        };
+        return response is not null && retryableStatusCodes.Contains(response.StatusCode);
     }
 }
