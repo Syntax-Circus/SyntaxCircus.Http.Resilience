@@ -380,6 +380,68 @@ public class HttpRequestResiliencePipelineTests
     }
 
     [Fact]
+    public async Task SendAsync_FailuresAgeOutOfSubPollyMinimumCircuitSamplingWindow()
+    {
+        var timeProvider = new ManualTimeProvider();
+        var factoryCalls = 0;
+        var sends = 0;
+        var circuitEvents = new List<HttpCircuitTelemetry>();
+        var pipeline = CreatePipeline(
+            timeProvider,
+            maxAttempts: 1,
+            circuitMinimumThroughput: 2,
+            circuitSamplingDuration: TimeSpan.FromMilliseconds(100),
+            onCircuit: (telemetry, _) => { circuitEvents.Add(telemetry); return ValueTask.CompletedTask; });
+
+        using var first = await pipeline.SendAsync(
+            (_, _) =>
+            {
+                factoryCalls++;
+                return ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/first"));
+            },
+            (_, _, _) => Task.FromResult(new HttpResponseMessage(++sends <= 2
+                ? HttpStatusCode.ServiceUnavailable
+                : HttpStatusCode.OK)),
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        timeProvider.Advance(TimeSpan.FromMilliseconds(200));
+
+        using var second = await pipeline.SendAsync(
+            (_, _) =>
+            {
+                factoryCalls++;
+                return ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/second"));
+            },
+            (_, _, _) => Task.FromResult(new HttpResponseMessage(++sends <= 2
+                ? HttpStatusCode.ServiceUnavailable
+                : HttpStatusCode.OK)),
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        using var third = await pipeline.SendAsync(
+            (_, _) =>
+            {
+                factoryCalls++;
+                return ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/third"));
+            },
+            (_, _, _) => Task.FromResult(new HttpResponseMessage(++sends <= 2
+                ? HttpStatusCode.ServiceUnavailable
+                : HttpStatusCode.OK)),
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        first.StatusCode.ShouldBe(HttpStatusCode.ServiceUnavailable);
+        second.StatusCode.ShouldBe(HttpStatusCode.ServiceUnavailable);
+        third.StatusCode.ShouldBe(HttpStatusCode.OK);
+        factoryCalls.ShouldBe(3);
+        circuitEvents.ShouldBeEmpty();
+    }
+
+    [Fact]
     public async Task SendAsync_CircuitTransitionsHalfOpenAndClosedWithSafeTelemetry()
     {
         var timeProvider = new ManualTimeProvider();
@@ -542,6 +604,7 @@ public class HttpRequestResiliencePipelineTests
         TimeSpan? backoffDelay = null,
         TimeSpan? maximumDelay = null,
         int circuitMinimumThroughput = 20,
+        TimeSpan? circuitSamplingDuration = null,
         Func<double>? jitterProvider = null,
         Func<HttpRetryTelemetry, CancellationToken, ValueTask>? onRetry = null,
         Func<HttpCircuitTelemetry, CancellationToken, ValueTask>? onCircuit = null)
@@ -553,7 +616,7 @@ public class HttpRequestResiliencePipelineTests
             MaximumDelay = maximumDelay ?? TimeSpan.FromSeconds(10),
             CircuitFailureRatio = 0.5,
             CircuitMinimumThroughput = circuitMinimumThroughput,
-            CircuitSamplingDuration = TimeSpan.FromSeconds(30),
+            CircuitSamplingDuration = circuitSamplingDuration ?? TimeSpan.FromSeconds(30),
             CircuitBreakDuration = TimeSpan.FromSeconds(5),
             TimeProvider = timeProvider,
             JitterProvider = jitterProvider ?? (() => 0),
