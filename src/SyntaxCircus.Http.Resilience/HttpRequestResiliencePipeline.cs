@@ -10,6 +10,8 @@ public sealed class HttpRequestResiliencePipeline
 {
     private static readonly TimeSpan PollyMinimumCircuitDuration = TimeSpan.FromMilliseconds(500) + TimeSpan.FromTicks(1);
     private static readonly TimeSpan PollyMaximumCircuitDuration = TimeSpan.FromDays(1);
+    private const long MaximumRelevantCircuitElapsedTicks = TimeSpan.TicksPerDay + 1;
+    private static readonly DateTimeOffset CircuitUtcEpoch = DateTimeOffset.UnixEpoch;
     private static readonly ResiliencePropertyKey<ExecutionState> ExecutionStateKey = new("HttpRequestExecutionState");
 
     private readonly string _name;
@@ -410,9 +412,10 @@ public sealed class HttpRequestResiliencePipeline
         private readonly TimeProvider _inner;
         private readonly TimeScale _samplingScale;
         private readonly TimeScale _openScale;
-        private readonly DateTimeOffset _startUtc;
         private long _actualAnchorTimestamp;
         private long _virtualAnchorTicks;
+        private long _utcActualAnchorTimestamp;
+        private DateTimeOffset _virtualUtcAnchor;
         private TimeScale _currentScale;
 
         private CircuitTimeProvider(
@@ -427,7 +430,8 @@ public sealed class HttpRequestResiliencePipeline
             _openScale = new TimeScale(PollyBreakDuration.Ticks, breakDuration.Ticks);
             _currentScale = _samplingScale;
             _actualAnchorTimestamp = inner.GetTimestamp();
-            _startUtc = inner.GetUtcNow();
+            _utcActualAnchorTimestamp = _actualAnchorTimestamp;
+            _virtualUtcAnchor = CircuitUtcEpoch;
         }
 
         public override TimeZoneInfo LocalTimeZone => _inner.LocalTimeZone;
@@ -462,9 +466,10 @@ public sealed class HttpRequestResiliencePipeline
 
         public override DateTimeOffset GetUtcNow()
         {
-            var scaledElapsed = TimeSpan.FromTicks(GetTimestamp());
-            var maximumElapsed = DateTimeOffset.MaxValue - _startUtc;
-            return _startUtc + (scaledElapsed <= maximumElapsed ? scaledElapsed : maximumElapsed);
+            lock (_gate)
+            {
+                return GetUtcNowCore();
+            }
         }
 
         public override long GetTimestamp()
@@ -495,20 +500,31 @@ public sealed class HttpRequestResiliencePipeline
 
         private long GetTimestampCore()
         {
-            var actualElapsed = _inner.GetElapsedTime(_actualAnchorTimestamp);
-            var scaledTicks = _currentScale.ToPollyTicks(actualElapsed.Ticks);
-            var remainingTicks = TimeSpan.MaxValue.Ticks - _virtualAnchorTicks;
-            return scaledTicks >= remainingTicks
-                ? TimeSpan.MaxValue.Ticks
-                : _virtualAnchorTicks + scaledTicks;
+            var actualTimestamp = _inner.GetTimestamp();
+            var actualElapsed = _inner.GetElapsedTime(_actualAnchorTimestamp, actualTimestamp);
+            var scaledTicks = _currentScale.ToPollyTicks(actualElapsed.Ticks, MaximumRelevantCircuitElapsedTicks);
+            _actualAnchorTimestamp = actualTimestamp;
+            _virtualAnchorTicks = unchecked(_virtualAnchorTicks + scaledTicks);
+            return _virtualAnchorTicks;
         }
 
         private void SwitchScale(TimeScale scale)
         {
             var timestamp = GetTimestampCore();
-            _actualAnchorTimestamp = _inner.GetTimestamp();
+            var utcNow = GetUtcNowCore();
             _virtualAnchorTicks = timestamp;
+            _virtualUtcAnchor = utcNow;
             _currentScale = scale;
+        }
+
+        private DateTimeOffset GetUtcNowCore()
+        {
+            var actualTimestamp = _inner.GetTimestamp();
+            var actualElapsed = _inner.GetElapsedTime(_utcActualAnchorTimestamp, actualTimestamp);
+            var scaledTicks = _currentScale.ToPollyTicks(actualElapsed.Ticks, MaximumRelevantCircuitElapsedTicks);
+            _utcActualAnchorTimestamp = actualTimestamp;
+            _virtualUtcAnchor += TimeSpan.FromTicks(scaledTicks);
+            return _virtualUtcAnchor;
         }
 
         private TimeSpan ToCallerDuration(TimeSpan duration)
@@ -532,10 +548,10 @@ public sealed class HttpRequestResiliencePipeline
 
         private readonly record struct TimeScale(long PollyTicks, long CallerTicks)
         {
-            public long ToPollyTicks(long callerTicks)
+            public long ToPollyTicks(long callerTicks, long maximumTicks)
             {
                 var ticks = (BigInteger)callerTicks * PollyTicks / CallerTicks;
-                return ticks >= TimeSpan.MaxValue.Ticks ? TimeSpan.MaxValue.Ticks : (long)ticks;
+                return ticks >= maximumTicks ? maximumTicks : (long)ticks;
             }
 
             public long ToCallerTicks(long pollyTicks)

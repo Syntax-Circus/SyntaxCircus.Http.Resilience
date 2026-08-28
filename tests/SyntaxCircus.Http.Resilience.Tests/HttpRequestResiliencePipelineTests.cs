@@ -495,6 +495,58 @@ public class HttpRequestResiliencePipelineTests
     }
 
     [Fact]
+    public async Task SendAsync_OneTickSamplingFailuresStillAgeAfterOldTimestampSaturationPoint()
+    {
+        var timeProvider = new ManualTimeProvider();
+        var factoryCalls = 0;
+        var pipeline = CreatePipeline(
+            timeProvider,
+            maxAttempts: 1,
+            circuitMinimumThroughput: 2,
+            circuitSamplingDuration: TimeSpan.FromTicks(1));
+
+        timeProvider.Advance(TimeSpan.FromDays(3));
+        using var first = await pipeline.SendAsync(
+            (_, _) =>
+            {
+                factoryCalls++;
+                return ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/first"));
+            },
+            (_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)),
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        timeProvider.Advance(TimeSpan.FromDays(3));
+        using var second = await pipeline.SendAsync(
+            (_, _) =>
+            {
+                factoryCalls++;
+                return ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/second"));
+            },
+            (_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)),
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        using var third = await pipeline.SendAsync(
+            (_, _) =>
+            {
+                factoryCalls++;
+                return ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/third"));
+            },
+            (_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)),
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        first.StatusCode.ShouldBe(HttpStatusCode.ServiceUnavailable);
+        second.StatusCode.ShouldBe(HttpStatusCode.ServiceUnavailable);
+        third.StatusCode.ShouldBe(HttpStatusCode.ServiceUnavailable);
+        factoryCalls.ShouldBe(3);
+    }
+
+    [Fact]
     public async Task SendAsync_CircuitTransitionsHalfOpenAndClosedWithSafeTelemetry()
     {
         var timeProvider = new ManualTimeProvider();
