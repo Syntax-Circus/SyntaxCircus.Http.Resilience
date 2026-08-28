@@ -239,6 +239,74 @@ public class HttpRequestResiliencePipelineTests
         responseContent.Disposed.ShouldBeTrue();
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SendAsync_ResponseObserverFailure_DoesNotRetryDisposesResponseAndPreservesException(bool timeoutFailure)
+    {
+        var sends = 0;
+        var responseContents = new List<TrackingContent>();
+        Exception observerException = timeoutFailure
+            ? new TimeoutException("observer timeout")
+            : new HttpRequestException("observer transport");
+        var pipeline = new HttpRequestResiliencePipeline("test", new HttpRequestResilienceOptions
+        {
+            MaxAttempts = 2,
+            TotalRequestTimeout = TimeSpan.FromSeconds(5),
+            BackoffBaseDelay = TimeSpan.FromMilliseconds(1),
+            MaximumDelay = TimeSpan.FromMilliseconds(1),
+            CircuitMinimumThroughput = 20,
+            TimeProvider = TimeProvider.System,
+            JitterProvider = () => 0,
+        });
+
+        var actual = await Should.ThrowAsync<Exception>(() => pipeline.SendAsync(
+            (attempt, _) => ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, $"https://example.test/{attempt}")),
+            (_, _, _) =>
+            {
+                sends++;
+                var content = new TrackingContent();
+                responseContents.Add(content);
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+            },
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            (_, _) => throw observerException,
+            TestContext.Current.CancellationToken));
+
+        actual.ShouldBeSameAs(observerException);
+        responseContents[0].Disposed.ShouldBeTrue();
+        sends.ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task SendAsync_MaxValueTotalBudget_HasNoDeadline()
+    {
+        var sends = 0;
+        var attemptToken = default(CancellationToken);
+        var callerToken = TestContext.Current.CancellationToken;
+        var pipeline = CreatePipeline(
+            new ManualTimeProvider(),
+            maxAttempts: 1,
+            totalTimeout: TimeSpan.MaxValue);
+
+        using var response = await pipeline.SendAsync(
+            (attempt, _) => ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, $"https://example.test/{attempt}")),
+            (_, _, cancellationToken) =>
+            {
+                sends++;
+                attemptToken = cancellationToken;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+            },
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            cancellationToken: callerToken);
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        sends.ShouldBe(1);
+        attemptToken.ShouldBe(callerToken);
+    }
+
     [Fact]
     public async Task SendAsync_TotalBudgetIncludesAttemptsAndRetryDelays()
     {

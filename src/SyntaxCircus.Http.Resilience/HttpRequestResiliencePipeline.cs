@@ -1,5 +1,6 @@
 using System.Net.Http;
 using System.Numerics;
+using System.Runtime.ExceptionServices;
 using Polly;
 using Polly.CircuitBreaker;
 using Polly.Retry;
@@ -177,9 +178,13 @@ public sealed class HttpRequestResiliencePipeline
             replaySafety,
             responseObserver,
             _options.TimeProvider.GetTimestamp());
-        using var timeoutSource = new CancellationTokenSource(_options.TotalRequestTimeout, _options.TimeProvider);
-        using var budgetSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
-        var context = ResilienceContextPool.Shared.Get(budgetSource.Token);
+        using var timeoutSource = _options.TotalRequestTimeout == TimeSpan.MaxValue
+            ? null
+            : new CancellationTokenSource(_options.TotalRequestTimeout, _options.TimeProvider);
+        using var budgetSource = timeoutSource is null
+            ? null
+            : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
+        var context = ResilienceContextPool.Shared.Get(budgetSource?.Token ?? cancellationToken);
         context.Properties.Set(ExecutionStateKey, state);
 
         try
@@ -191,12 +196,18 @@ public sealed class HttpRequestResiliencePipeline
             state.ReleaseResponse(result.Response);
             return result.Response;
         }
+        catch (ResponseObserverException exception)
+        {
+            state.DisposePendingResponse();
+            ExceptionDispatchInfo.Capture(exception.InnerException!).Throw();
+            throw;
+        }
         catch (OperationCanceledException exception) when (cancellationToken.IsCancellationRequested)
         {
             state.DisposePendingResponse();
             throw new OperationCanceledException(exception.Message, exception, cancellationToken);
         }
-        catch (OperationCanceledException exception) when (timeoutSource.IsCancellationRequested)
+        catch (OperationCanceledException exception) when (timeoutSource?.IsCancellationRequested == true)
         {
             state.DisposePendingResponse();
             throw new HttpRequestTimeoutException(_name, _options.TotalRequestTimeout, exception);
@@ -389,7 +400,15 @@ public sealed class HttpRequestResiliencePipeline
 
             if (responseObserver is not null)
             {
-                await responseObserver(response, cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await responseObserver(response, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    DisposePendingResponse();
+                    throw new ResponseObserverException(exception);
+                }
             }
 
             return new AttemptResult(response, this);
@@ -405,6 +424,9 @@ public sealed class HttpRequestResiliencePipeline
             Interlocked.Exchange(ref _pendingResponse, null)?.Dispose();
         }
     }
+
+    private sealed class ResponseObserverException(Exception innerException)
+        : Exception("The response observer failed.", innerException);
 
     private sealed class CircuitTimeProvider : TimeProvider
     {
