@@ -63,6 +63,57 @@ builder.Services.AddResilientHttpClient(
 
 Wraps the named `HttpClient` in a Polly retry (exponential backoff + jitter) and circuit-breaker pipeline, retrying transient errors and 429/5xx. Pass `aiMode: true` for AI/LLM provider clients where a 429 means "back off on purpose" rather than "something's broken" — it's excluded from retry/circuit-breaking in that mode.
 
+## HttpRequestResiliencePipeline
+
+`HttpRequestResiliencePipeline` is the request-execution API for code that needs explicit retry ownership. Construct it directly when the policy is local to a consumer:
+
+```csharp
+var pipeline = new HttpRequestResiliencePipeline(
+    "widgets",
+    new HttpRequestResilienceOptions
+    {
+        MaxAttempts = 3,
+        TotalRequestTimeout = TimeSpan.FromSeconds(30),
+        BackoffBaseDelay = TimeSpan.FromMilliseconds(100),
+        MaximumDelay = TimeSpan.FromSeconds(5),
+    });
+
+using var response = await pipeline.SendAsync(
+    (attempt, _) => ValueTask.FromResult(
+        new HttpRequestMessage(HttpMethod.Get, $"https://widgets.example.com/{attempt}")),
+    (request, completionOption, cancellationToken) => httpClient.SendAsync(request, completionOption, cancellationToken),
+    HttpCompletionOption.ResponseHeadersRead,
+    HttpRequestReplaySafety.Replayable,
+    cancellationToken: cancellationToken);
+```
+
+For shared named policies, register a keyed singleton and resolve it with the standard DI extension:
+
+```csharp
+services.AddHttpRequestResiliencePipeline(
+    "widgets",
+    new HttpRequestResilienceOptions
+    {
+        MaxAttempts = 3,
+        TotalRequestTimeout = TimeSpan.FromSeconds(30),
+        BackoffBaseDelay = TimeSpan.FromMilliseconds(100),
+        MaximumDelay = TimeSpan.FromSeconds(5),
+    });
+
+var pipeline = serviceProvider.GetRequiredKeyedService<HttpRequestResiliencePipeline>("widgets");
+using var response = await pipeline.SendAsync(
+    (attempt, _) => ValueTask.FromResult(
+        new HttpRequestMessage(HttpMethod.Get, $"https://widgets.example.com/{attempt}")),
+    (request, completionOption, cancellationToken) => httpClient.SendAsync(request, completionOption, cancellationToken),
+    HttpCompletionOption.ResponseHeadersRead,
+    HttpRequestReplaySafety.Replayable,
+    cancellationToken: cancellationToken);
+```
+
+Every attempt needs a **fresh request factory**: the pipeline disposes each request after its send, so never return a reused `HttpRequestMessage`. Mark an operation `Replayable` only when repeating it is safe; `NotReplayable` sends at most once. The returned final response belongs to the caller and must be disposed. A caller cancellation remains an `OperationCanceledException`; exhausting `TotalRequestTimeout` throws `HttpRequestTimeoutException`; an open circuit throws `HttpCircuitOpenException`.
+
+`OnRetry` and `OnCircuitStateChanged` receive retry/circuit telemetry. Callback failures are non-fatal and never replace the request outcome. Keyed registration validates and snapshots the supplied immutable `HttpRequestResilienceOptions` as it creates the singleton. It intentionally adds neither a `DelegatingHandler` nor an `HttpClient`: migrate selected manual request paths to this API while retaining `AddResilientHttpClient` for existing `HttpClientFactory` registrations.
+
 ## CachedTokenProvider
 
 ```csharp
