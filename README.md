@@ -61,7 +61,7 @@ builder.Services.AddResilientHttpClient(
     .AddTypedClient<WidgetApiClient>();
 ```
 
-Wraps the named `HttpClient` in a Polly retry (exponential backoff + jitter) and circuit-breaker pipeline, retrying transient errors and 429/5xx. Pass `aiMode: true` for AI/LLM provider clients where a 429 means "back off on purpose" rather than "something's broken" — it's excluded from retry/circuit-breaking in that mode.
+Wraps the named `HttpClient` in a Polly retry (exponential backoff + jitter) and circuit-breaker pipeline, retrying transport failures, non-caller timeouts, and exactly HTTP 408, 429, 500, 502, 503, and 504. Pass `aiMode: true` for AI/LLM provider clients where a 429 means "back off on purpose" rather than "something's broken" — only 429 is excluded from retry/circuit-breaking in that mode.
 
 ## HttpRequestResiliencePipeline
 
@@ -135,7 +135,9 @@ using var response = await pipeline.SendAsync(
 
 Every attempt needs a **fresh request factory**: the pipeline disposes each request after its send, so never return a reused `HttpRequestMessage`. Mark an operation `Replayable` only when repeating it is safe; `NotReplayable` sends at most once. The returned final response belongs to the caller and must be disposed. A caller cancellation remains an `OperationCanceledException`; exhausting `TotalRequestTimeout` throws `HttpRequestTimeoutException`; an open circuit throws `HttpCircuitOpenException`.
 
-`RetryableStatusCodes` defaults to 408, 429, 500, 502, 503, and 504. `RetryableExceptionCategories` defaults to `Transport` and `Timeout`; only those two exception categories are valid configuration values. Retry and circuit classification share these sets, and each pipeline snapshots them during construction so later collection mutation cannot change a live policy.
+`TotalRequestTimeout` is one hard monotonic deadline across request construction, sending, response observation, attempts, and delays. Every positive finite duration is accepted; `TimeSpan.MaxValue` means no logical deadline. If a factory, sender, or observer ignores cancellation, the caller still receives cancellation or timeout promptly. The pipeline retains its request/response ownership until that late work completes, observes late exceptions, runs the observer once for any late response, and disposes the late owned state.
+
+`RetryableStatusCodes` defaults to 408, 429, 500, 502, 503, and 504. `RetryableExceptionCategories` defaults to `Transport` and `Timeout`; only those two exception categories are valid configuration values. Retry and circuit classification share these sets. The pipeline snapshots every option during construction, so later mutation cannot change a live policy. Caller cancellation and observer failure do not contribute circuit throughput or change circuit state; a canceled or observer-failed half-open probe releases the probe slot for the next real outcome.
 
 `OnRetry`, `OnTimeout`, and `OnCircuitStateChanged` receive bounded retry, logical-budget timeout, and circuit telemetry. A timeout event contains only the pipeline name, `Timeout` failure category, and configured total budget. Callback failures are non-fatal and never replace success, timeout, caller cancellation, or another request outcome. Keyed registration validates and snapshots the supplied `HttpRequestResilienceOptions` as it creates the singleton. It intentionally adds neither a `DelegatingHandler` nor an `HttpClient`: migrate selected manual request paths to this API while retaining `AddResilientHttpClient` for existing `HttpClientFactory` registrations.
 

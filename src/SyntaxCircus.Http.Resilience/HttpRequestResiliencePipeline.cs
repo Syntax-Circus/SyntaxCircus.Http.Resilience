@@ -1,25 +1,20 @@
 using System.Collections.Frozen;
+using System.Net;
 using System.Net.Http;
-using System.Numerics;
 using System.Runtime.ExceptionServices;
 using Polly;
-using Polly.CircuitBreaker;
 using Polly.Retry;
 
 namespace SyntaxCircus.Http.Resilience;
 
 public sealed class HttpRequestResiliencePipeline
 {
-    private static readonly TimeSpan PollyMinimumCircuitDuration = TimeSpan.FromMilliseconds(500) + TimeSpan.FromTicks(1);
-    private static readonly TimeSpan PollyMaximumCircuitDuration = TimeSpan.FromDays(1);
-    private const long MaximumRelevantCircuitElapsedTicks = TimeSpan.TicksPerDay + 1;
-    private static readonly DateTimeOffset CircuitUtcEpoch = DateTimeOffset.UnixEpoch;
     private static readonly ResiliencePropertyKey<ExecutionState> ExecutionStateKey = new("HttpRequestExecutionState");
 
     private readonly string _name;
     private readonly HttpRequestResilienceOptions _options;
-    private readonly ResiliencePipeline<AttemptResult> _pipeline;
-    private long _circuitOpenedTimestamp;
+    private readonly ResiliencePipeline<AttemptResult> _retryPipeline;
+    private readonly LogicalCircuitBreaker _circuitBreaker;
 
     public HttpRequestResiliencePipeline(string name, HttpRequestResilienceOptions options)
     {
@@ -48,7 +43,8 @@ public sealed class HttpRequestResiliencePipeline
             OnCircuitStateChanged = options.OnCircuitStateChanged,
         };
 
-        _pipeline = BuildPipeline();
+        _circuitBreaker = new LogicalCircuitBreaker(_name, _options);
+        _retryPipeline = BuildRetryPipeline();
     }
 
     public Task<HttpResponseMessage> SendAsync(
@@ -71,68 +67,6 @@ public sealed class HttpRequestResiliencePipeline
             cancellationToken);
     }
 
-    private ResiliencePipeline<AttemptResult> BuildPipeline()
-    {
-        var retryPipeline = BuildRetryPipeline();
-        var circuitTimeProvider = CircuitTimeProvider.Create(
-            _options.TimeProvider,
-            _options.CircuitSamplingDuration,
-            _options.CircuitBreakDuration);
-        var builder = new ResiliencePipelineBuilder<AttemptResult>
-        {
-            TimeProvider = circuitTimeProvider,
-        };
-
-        builder.AddCircuitBreaker(new CircuitBreakerStrategyOptions<AttemptResult>
-        {
-            FailureRatio = _options.CircuitFailureRatio,
-            MinimumThroughput = _options.CircuitMinimumThroughput,
-            SamplingDuration = circuitTimeProvider.PollySamplingDuration,
-            BreakDuration = circuitTimeProvider.PollyBreakDuration,
-            ShouldHandle = args => ValueTask.FromResult(TryClassify(args.Outcome, args.Context.CancellationToken, out _)),
-            OnOpened = async args =>
-            {
-                circuitTimeProvider.EnterOpenState();
-                Volatile.Write(ref _circuitOpenedTimestamp, _options.TimeProvider.GetTimestamp());
-                var category = TryClassify(args.Outcome, args.Context.CancellationToken, out var classified)
-                    ? classified
-                    : HttpResilienceFailureCategory.CircuitOpen;
-                await InvokeCircuitCallbackSafelyAsync(
-                    new HttpCircuitTelemetry(
-                        _name,
-                        HttpResilienceCircuitState.Open,
-                        args.Outcome.Result?.Response.StatusCode,
-                        category),
-                    args.Context.CancellationToken).ConfigureAwait(false);
-            },
-            OnHalfOpened = async args =>
-            {
-                circuitTimeProvider.EnterSamplingState();
-                await InvokeCircuitCallbackSafelyAsync(
-                    new HttpCircuitTelemetry(
-                        _name,
-                        HttpResilienceCircuitState.HalfOpen,
-                        null,
-                        HttpResilienceFailureCategory.CircuitOpen),
-                    args.Context.CancellationToken).ConfigureAwait(false);
-            },
-            OnClosed = async args =>
-            {
-                circuitTimeProvider.EnterSamplingState();
-                await InvokeCircuitCallbackSafelyAsync(
-                    new HttpCircuitTelemetry(
-                        _name,
-                        HttpResilienceCircuitState.Closed,
-                        args.Outcome.Result?.Response.StatusCode,
-                        ClassifyForTelemetry(args.Outcome, args.Context.CancellationToken)),
-                    args.Context.CancellationToken).ConfigureAwait(false);
-            },
-        });
-
-        builder.AddPipeline(retryPipeline);
-        return builder.Build();
-    }
-
     private ResiliencePipeline<AttemptResult> BuildRetryPipeline()
     {
         var builder = new ResiliencePipelineBuilder<AttemptResult>
@@ -145,9 +79,14 @@ public sealed class HttpRequestResiliencePipeline
             builder.AddRetry(new RetryStrategyOptions<AttemptResult>
             {
                 MaxRetryAttempts = _options.MaxAttempts - 1,
-                ShouldHandle = args => ValueTask.FromResult(
-                    GetExecutionState(args.Context).ReplaySafety == HttpRequestReplaySafety.Replayable
-                    && TryClassify(args.Outcome, args.Context.CancellationToken, out _)),
+                ShouldHandle = args =>
+                {
+                    var state = GetExecutionState(args.Context);
+                    return ValueTask.FromResult(
+                        state.ReplaySafety == HttpRequestReplaySafety.Replayable
+                        && !state.Budget.HasTerminalOutcome
+                        && TryClassify(args.Outcome, args.Context.CancellationToken, out _));
+                },
                 DelayGenerator = args => ValueTask.FromResult<TimeSpan?>(GetRetryDelay(args)),
                 OnRetry = async args =>
                 {
@@ -160,6 +99,7 @@ public sealed class HttpRequestResiliencePipeline
                             ClassifyForTelemetry(args.Outcome, args.Context.CancellationToken),
                             args.RetryDelay),
                         args.Context.CancellationToken).ConfigureAwait(false);
+                    GetExecutionState(args.Context).Budget.ThrowIfTerminal();
                 },
             });
         }
@@ -175,82 +115,167 @@ public sealed class HttpRequestResiliencePipeline
         Func<HttpResponseMessage, CancellationToken, ValueTask>? responseObserver,
         CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var budget = new RequestBudget(_options.TimeProvider, _options.TotalRequestTimeout, cancellationToken);
+        budget.ThrowIfTerminal();
+
+        var circuitEntry = _circuitBreaker.TryEnter();
+        if (cancellationToken.IsCancellationRequested)
+        {
+            _circuitBreaker.Exclude(circuitEntry);
+            ThrowCallerCancellation(cancellationToken);
+        }
+        if (!circuitEntry.IsAdmitted)
+        {
+            budget.ThrowIfTerminal();
+            throw new HttpCircuitOpenException(_name, circuitEntry.RetryAfter);
+        }
+
+        await InvokeCircuitCallbackSafelyAsync(circuitEntry.Transition, cancellationToken).ConfigureAwait(false);
+
         var state = new ExecutionState(
             requestFactory,
             sender,
             completionOption,
             replaySafety,
             responseObserver,
-            _options.TimeProvider.GetTimestamp(),
-            cancellationToken);
-        using var timeoutSource = _options.TotalRequestTimeout == TimeSpan.MaxValue
-            ? null
-            : new CancellationTokenSource(_options.TotalRequestTimeout, _options.TimeProvider);
-        using var budgetSource = timeoutSource is null
-            ? null
-            : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
-        var context = ResilienceContextPool.Shared.Get(budgetSource?.Token ?? cancellationToken);
-        context.Properties.Set(ExecutionStateKey, state);
+            budget);
+        ResilienceContext? context = null;
 
         try
         {
-            var result = await _pipeline.ExecuteAsync(
-                static (executionContext, executionState) => executionState.SendAttemptAsync(executionContext.CancellationToken),
-                context,
-                state).ConfigureAwait(false);
+            budget.ThrowIfTerminal();
+            context = ResilienceContextPool.Shared.Get(budget.ExecutionToken);
+            context.Properties.Set(ExecutionStateKey, state);
+
+            AttemptResult result;
+            try
+            {
+                result = await _retryPipeline.ExecuteAsync(
+                    static (executionContext, executionState) => executionState.SendAttemptAsync(executionContext.CancellationToken),
+                    context,
+                    state).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                state.DisposePendingResponseBestEffort();
+                return await MapTerminalExceptionAsync(exception, circuitEntry, budget, cancellationToken).ConfigureAwait(false);
+            }
+
+            try
+            {
+                budget.ThrowIfTerminal();
+            }
+            catch (Exception exception)
+            {
+                result.DisposeForTerminal();
+                return await MapTerminalExceptionAsync(exception, circuitEntry, budget, cancellationToken).ConfigureAwait(false);
+            }
+
+            var transition = _circuitBreaker.Complete(
+                circuitEntry,
+                ClassifyCircuitOutcome(result.Response, exception: null));
+            await InvokeCircuitCallbackSafelyAsync(transition, cancellationToken).ConfigureAwait(false);
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                result.DisposeForTerminal();
+                ThrowCallerCancellation(cancellationToken);
+            }
+
             state.ReleaseResponse(result.Response);
             return result.Response;
         }
-        catch (ResponseObserverException exception)
+        catch (Exception exception) when (context is null)
         {
-            state.DisposePendingResponseBestEffort();
-            ExceptionDispatchInfo.Capture(exception.InnerException!).Throw();
-            throw;
-        }
-        catch (OperationCanceledException exception) when (cancellationToken.IsCancellationRequested)
-        {
-            state.DisposePendingResponseBestEffort();
-            throw new OperationCanceledException(exception.Message, exception, cancellationToken);
-        }
-        catch (OperationCanceledException exception) when (timeoutSource?.IsCancellationRequested == true)
-        {
-            state.DisposePendingResponseBestEffort();
-            await InvokeTimeoutCallbackSafelyAsync(
-                new HttpTimeoutTelemetry(
-                    _name,
-                    HttpResilienceFailureCategory.Timeout,
-                    _options.TotalRequestTimeout),
-                cancellationToken).ConfigureAwait(false);
-            throw new HttpRequestTimeoutException(_name, _options.TotalRequestTimeout, exception);
-        }
-        catch (BrokenCircuitException exception)
-        {
-            state.DisposePendingResponseBestEffort();
-            throw new HttpCircuitOpenException(_name, GetCircuitRetryAfter(), exception);
-        }
-        catch
-        {
-            state.DisposePendingResponseBestEffort();
-            throw;
+            return await MapTerminalExceptionAsync(exception, circuitEntry, budget, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            ResilienceContextPool.Shared.Return(context);
+            if (context is not null)
+            {
+                ResilienceContextPool.Shared.Return(context);
+            }
         }
+    }
+
+    private async Task<HttpResponseMessage> MapTerminalExceptionAsync(
+        Exception exception,
+        CircuitEntry circuitEntry,
+        RequestBudget budget,
+        CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            _circuitBreaker.Exclude(circuitEntry);
+            ThrowCallerCancellation(cancellationToken, exception);
+        }
+
+        if (budget.IsExpired)
+        {
+            return await ThrowLogicalTimeoutAsync(circuitEntry, exception, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (exception is ResponseObserverException observerException)
+        {
+            _circuitBreaker.Exclude(circuitEntry);
+            ExceptionDispatchInfo.Capture(observerException.InnerException!).Throw();
+        }
+
+        var transition = _circuitBreaker.Complete(
+            circuitEntry,
+            ClassifyCircuitOutcome(response: null, exception));
+        await InvokeCircuitCallbackSafelyAsync(transition, cancellationToken).ConfigureAwait(false);
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            ThrowCallerCancellation(cancellationToken, exception);
+        }
+
+        ExceptionDispatchInfo.Capture(exception).Throw();
+        throw new InvalidOperationException("Unreachable exception mapping path.");
+    }
+
+    private async Task<HttpResponseMessage> ThrowLogicalTimeoutAsync(
+        CircuitEntry circuitEntry,
+        Exception innerException,
+        CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            _circuitBreaker.Exclude(circuitEntry);
+            ThrowCallerCancellation(cancellationToken, innerException);
+        }
+
+        await InvokeTimeoutCallbackSafelyAsync(
+            new HttpTimeoutTelemetry(
+                _name,
+                HttpResilienceFailureCategory.Timeout,
+                _options.TotalRequestTimeout),
+            cancellationToken).ConfigureAwait(false);
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            _circuitBreaker.Exclude(circuitEntry);
+            ThrowCallerCancellation(cancellationToken, innerException);
+        }
+
+        var timeoutOutcome = ClassifyCircuitOutcome(
+            response: null,
+            new LogicalTimeoutException(innerException));
+        var transition = _circuitBreaker.Complete(circuitEntry, timeoutOutcome);
+        await InvokeCircuitCallbackSafelyAsync(transition, cancellationToken).ConfigureAwait(false);
+
+        throw new HttpRequestTimeoutException(_name, _options.TotalRequestTimeout, innerException);
     }
 
     private TimeSpan GetRetryDelay(RetryDelayGeneratorArguments<AttemptResult> args)
     {
         var state = GetExecutionState(args.Context);
+        var remaining = state.Budget.GetPositiveRemainingOrThrow();
         var delay = TryGetRetryAfter(args.Outcome.Result?.Response, out var retryAfter)
             ? retryAfter
             : GetBackoffDelay(args.AttemptNumber);
-        var remaining = _options.TotalRequestTimeout - _options.TimeProvider.GetElapsedTime(state.StartTimestamp);
-
-        if (remaining <= TimeSpan.Zero)
-        {
-            return TimeSpan.Zero;
-        }
 
         return Min(delay, _options.MaximumDelay, remaining);
     }
@@ -301,18 +326,6 @@ public sealed class HttpRequestResiliencePipeline
             ? first <= third ? first : third
             : second <= third ? second : third;
 
-    private TimeSpan? GetCircuitRetryAfter()
-    {
-        var openedTimestamp = Volatile.Read(ref _circuitOpenedTimestamp);
-        if (openedTimestamp == 0)
-        {
-            return null;
-        }
-
-        var remaining = _options.CircuitBreakDuration - _options.TimeProvider.GetElapsedTime(openedTimestamp);
-        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
-    }
-
     private static ExecutionState GetExecutionState(ResilienceContext context)
         => context.Properties.TryGetValue(ExecutionStateKey, out var state)
             ? state
@@ -335,9 +348,33 @@ public sealed class HttpRequestResiliencePipeline
         CancellationToken cancellationToken)
         => TryClassify(outcome, cancellationToken, out var category)
             ? category
-            : outcome.Exception is not null
-                ? HttpResilienceFailureCategory.Transport
-                : HttpResilienceFailureCategory.HttpStatus;
+            : ClassifyForTelemetry(outcome.Result?.Response, outcome.Exception);
+
+    private CircuitOutcome ClassifyCircuitOutcome(HttpResponseMessage? response, Exception? exception)
+    {
+        var isFailure = HttpResilienceOutcomeClassifier.TryClassify(
+            response,
+            exception,
+            _options.RetryableStatusCodes,
+            _options.RetryableExceptionCategories,
+            CancellationToken.None,
+            out var category);
+        return new CircuitOutcome(
+            isFailure,
+            response?.StatusCode,
+            isFailure ? category : ClassifyForTelemetry(response, exception));
+    }
+
+    private static HttpResilienceFailureCategory ClassifyForTelemetry(
+        HttpResponseMessage? response,
+        Exception? exception)
+        => exception switch
+        {
+            HttpRequestException => HttpResilienceFailureCategory.Transport,
+            TimeoutException or OperationCanceledException => HttpResilienceFailureCategory.Timeout,
+            _ when response is not null => HttpResilienceFailureCategory.HttpStatus,
+            _ => HttpResilienceFailureCategory.Transport,
+        };
 
     private async ValueTask InvokeRetryCallbackSafelyAsync(
         HttpRetryTelemetry telemetry,
@@ -358,10 +395,10 @@ public sealed class HttpRequestResiliencePipeline
     }
 
     private async ValueTask InvokeCircuitCallbackSafelyAsync(
-        HttpCircuitTelemetry telemetry,
+        HttpCircuitTelemetry? telemetry,
         CancellationToken cancellationToken)
     {
-        if (_options.OnCircuitStateChanged is null)
+        if (telemetry is null || _options.OnCircuitStateChanged is null)
         {
             return;
         }
@@ -393,31 +430,23 @@ public sealed class HttpRequestResiliencePipeline
         }
     }
 
+    private static void ThrowCallerCancellation(CancellationToken cancellationToken, Exception? innerException = null)
+        => throw new OperationCanceledException("The operation was canceled.", innerException, cancellationToken);
+
     private sealed class AttemptResult(HttpResponseMessage response, ExecutionState state)
     {
         public HttpResponseMessage Response { get; } = response;
 
         public void DisposeForRetry()
         {
-            try
-            {
-                DisposeBestEffort(Response);
-            }
-            finally
-            {
-                state.ReleaseResponse(Response);
-            }
+            DisposeBestEffort(Response);
+            state.ReleaseResponse(Response);
         }
 
-        private static void DisposeBestEffort(HttpResponseMessage disposable)
+        public void DisposeForTerminal()
         {
-            try
-            {
-                disposable.Dispose();
-            }
-            catch
-            {
-            }
+            DisposeBestEffort(Response);
+            state.ReleaseResponse(Response);
         }
     }
 
@@ -427,63 +456,129 @@ public sealed class HttpRequestResiliencePipeline
         HttpCompletionOption completionOption,
         HttpRequestReplaySafety replaySafety,
         Func<HttpResponseMessage, CancellationToken, ValueTask>? responseObserver,
-        long startTimestamp,
-        CancellationToken callerCancellationToken)
+        RequestBudget budget)
     {
         private HttpResponseMessage? _pendingResponse;
         private int _attemptNumber;
 
         public HttpRequestReplaySafety ReplaySafety { get; } = replaySafety;
 
-        public long StartTimestamp { get; } = startTimestamp;
+        public RequestBudget Budget { get; } = budget;
 
         public async ValueTask<AttemptResult> SendAttemptAsync(CancellationToken cancellationToken)
         {
+            Budget.ThrowIfTerminal();
             var attemptNumber = Interlocked.Increment(ref _attemptNumber);
             HttpRequestMessage? request = null;
+            HttpResponseMessage? response = null;
+
             try
             {
-                request = await requestFactory(attemptNumber, cancellationToken).ConfigureAwait(false)
-                    ?? throw new InvalidOperationException("The request factory returned null.");
-                var response = await sender(request, completionOption, cancellationToken).ConfigureAwait(false)
-                    ?? throw new InvalidOperationException("The sender returned null.");
-                Volatile.Write(ref _pendingResponse, response);
+                request = await CreateRequestAsync(attemptNumber, cancellationToken).ConfigureAwait(false);
+                Budget.ThrowIfTerminal();
+
+                Task<HttpResponseMessage> senderTask;
+                try
+                {
+                    senderTask = sender(request, completionOption, cancellationToken)
+                        ?? throw new InvalidOperationException("The sender returned null task.");
+                }
+                catch (Exception exception)
+                {
+                    Budget.ThrowIfTerminal(exception);
+                    throw;
+                }
+
+                if (!senderTask.IsCompleted)
+                {
+                    var completed = await Task.WhenAny(senderTask, Budget.SignalTask).ConfigureAwait(false);
+                    if (completed != senderTask)
+                    {
+                        _ = ObserveLateSenderAsync(senderTask, request);
+                        request = null;
+                        Budget.ThrowIfTerminal();
+                    }
+                }
+
+                try
+                {
+                    response = await senderTask.ConfigureAwait(false)
+                        ?? throw new InvalidOperationException("The sender returned null.");
+                }
+                catch (Exception exception)
+                {
+                    Budget.ThrowIfTerminal(exception);
+                    throw;
+                }
+
+                if (Budget.HasTerminalOutcome)
+                {
+                    _ = ObserveReceivedResponseAfterTerminalAsync(response, request!);
+                    response = null;
+                    request = null;
+                    Budget.ThrowIfTerminal();
+                }
 
                 if (responseObserver is not null)
                 {
+                    ValueTask observerWork;
                     try
                     {
-                        await responseObserver(response, cancellationToken).ConfigureAwait(false);
+                        observerWork = responseObserver(response!, cancellationToken);
                     }
                     catch (Exception exception)
                     {
-                        DisposePendingResponseBestEffort();
-                        DisposeBestEffort(request);
-                        request = null;
-                        if (callerCancellationToken.IsCancellationRequested)
+                        Budget.ThrowIfTerminal(exception);
+                        throw new ResponseObserverException(exception);
+                    }
+
+                    if (!observerWork.IsCompleted)
+                    {
+                        var observerTask = observerWork.AsTask();
+                        var completed = await Task.WhenAny(observerTask, Budget.SignalTask).ConfigureAwait(false);
+                        if (completed != observerTask)
                         {
-                            throw new OperationCanceledException("The operation was canceled.", exception, callerCancellationToken);
+                            _ = ObserveLateObserverAsync(observerTask, response!, request!);
+                            response = null;
+                            request = null;
+                            Budget.ThrowIfTerminal();
                         }
 
-                        throw new ResponseObserverException(exception);
+                        try
+                        {
+                            await observerTask.ConfigureAwait(false);
+                        }
+                        catch (Exception exception)
+                        {
+                            Budget.ThrowIfTerminal(exception);
+                            throw new ResponseObserverException(exception);
+                        }
+                    }
+                    else
+                    {
+                        try
+                        {
+                            await observerWork.ConfigureAwait(false);
+                        }
+                        catch (Exception exception)
+                        {
+                            Budget.ThrowIfTerminal(exception);
+                            throw new ResponseObserverException(exception);
+                        }
                     }
                 }
 
-                if (callerCancellationToken.IsCancellationRequested)
-                {
-                    DisposePendingResponseBestEffort();
-                    throw new OperationCanceledException(callerCancellationToken);
-                }
-
-                return new AttemptResult(response, this);
-            }
-            catch (Exception exception) when (callerCancellationToken.IsCancellationRequested)
-            {
-                DisposePendingResponseBestEffort();
-                throw new OperationCanceledException("The operation was canceled.", exception, callerCancellationToken);
+                Budget.ThrowIfTerminal();
+                DisposeBestEffort(request);
+                request = null;
+                Volatile.Write(ref _pendingResponse, response);
+                var result = new AttemptResult(response!, this);
+                response = null;
+                return result;
             }
             finally
             {
+                DisposeBestEffort(response);
                 DisposeBestEffort(request);
             }
         }
@@ -498,181 +593,531 @@ public sealed class HttpRequestResiliencePipeline
             DisposeBestEffort(Interlocked.Exchange(ref _pendingResponse, null));
         }
 
-        private static void DisposeBestEffort(IDisposable? disposable)
+        private async ValueTask<HttpRequestMessage> CreateRequestAsync(
+            int attemptNumber,
+            CancellationToken cancellationToken)
+        {
+            ValueTask<HttpRequestMessage> factoryWork;
+            try
+            {
+                factoryWork = requestFactory(attemptNumber, cancellationToken);
+            }
+            catch (Exception exception)
+            {
+                Budget.ThrowIfTerminal(exception);
+                throw;
+            }
+
+            if (!factoryWork.IsCompleted)
+            {
+                var factoryTask = factoryWork.AsTask();
+                var completed = await Task.WhenAny(factoryTask, Budget.SignalTask).ConfigureAwait(false);
+                if (completed != factoryTask)
+                {
+                    _ = ObserveLateFactoryAsync(factoryTask);
+                    Budget.ThrowIfTerminal();
+                }
+
+                try
+                {
+                    var request = await factoryTask.ConfigureAwait(false)
+                        ?? throw new InvalidOperationException("The request factory returned null.");
+                    if (Budget.HasTerminalOutcome)
+                    {
+                        DisposeBestEffort(request);
+                        Budget.ThrowIfTerminal();
+                    }
+
+                    return request;
+                }
+                catch (Exception exception)
+                {
+                    Budget.ThrowIfTerminal(exception);
+                    throw;
+                }
+            }
+
+            try
+            {
+                var request = await factoryWork.ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("The request factory returned null.");
+                if (Budget.HasTerminalOutcome)
+                {
+                    DisposeBestEffort(request);
+                    Budget.ThrowIfTerminal();
+                }
+
+                return request;
+            }
+            catch (Exception exception)
+            {
+                Budget.ThrowIfTerminal(exception);
+                throw;
+            }
+        }
+
+        private static async Task ObserveLateFactoryAsync(Task<HttpRequestMessage> factoryTask)
         {
             try
             {
-                disposable?.Dispose();
+                DisposeBestEffort(await factoryTask.ConfigureAwait(false));
             }
             catch
             {
-                // The operation outcome owns the result; cleanup must never replace or classify it.
+            }
+        }
+
+        private async Task ObserveLateSenderAsync(
+            Task<HttpResponseMessage> senderTask,
+            HttpRequestMessage request)
+        {
+            HttpResponseMessage? response = null;
+            try
+            {
+                response = await senderTask.ConfigureAwait(false);
+                if (response is not null && responseObserver is not null)
+                {
+                    try
+                    {
+                        await responseObserver(response, Budget.ExecutionToken).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                DisposeBestEffort(response);
+                DisposeBestEffort(request);
+            }
+        }
+
+        private async Task ObserveReceivedResponseAfterTerminalAsync(
+            HttpResponseMessage response,
+            HttpRequestMessage request)
+        {
+            try
+            {
+                if (responseObserver is not null)
+                {
+                    try
+                    {
+                        await responseObserver(response, Budget.ExecutionToken).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            finally
+            {
+                DisposeBestEffort(response);
+                DisposeBestEffort(request);
+            }
+        }
+
+        private static async Task ObserveLateObserverAsync(
+            Task observerTask,
+            HttpResponseMessage response,
+            HttpRequestMessage request)
+        {
+            try
+            {
+                await observerTask.ConfigureAwait(false);
+            }
+            catch
+            {
+            }
+            finally
+            {
+                DisposeBestEffort(response);
+                DisposeBestEffort(request);
             }
         }
     }
 
+    private sealed class RequestBudget : IDisposable
+    {
+        private static readonly TimeSpan MaximumTimerSegment = TimeSpan.FromDays(24);
+
+        private readonly TimeProvider _timeProvider;
+        private readonly TimeSpan _timeout;
+        private readonly CancellationToken _callerCancellationToken;
+        private readonly long _startTimestamp;
+        private readonly CancellationTokenSource? _deadlineSource;
+        private readonly CancellationTokenSource? _linkedSource;
+        private readonly TaskCompletionSource _signal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly CancellationTokenRegistration _signalRegistration;
+        private ITimer? _timer;
+        private int _disposed;
+        private int _expired;
+
+        public RequestBudget(
+            TimeProvider timeProvider,
+            TimeSpan timeout,
+            CancellationToken callerCancellationToken)
+        {
+            _timeProvider = timeProvider;
+            _timeout = timeout;
+            _callerCancellationToken = callerCancellationToken;
+            _startTimestamp = timeProvider.GetTimestamp();
+
+            if (timeout == TimeSpan.MaxValue)
+            {
+                ExecutionToken = callerCancellationToken;
+                _signalRegistration = callerCancellationToken.Register(
+                    static state => ((TaskCompletionSource)state!).TrySetResult(),
+                    _signal);
+                return;
+            }
+
+            _deadlineSource = new CancellationTokenSource();
+            _linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
+                callerCancellationToken,
+                _deadlineSource.Token);
+            ExecutionToken = _linkedSource.Token;
+            _signalRegistration = ExecutionToken.Register(
+                static state => ((TaskCompletionSource)state!).TrySetResult(),
+                _signal);
+            _timer = timeProvider.CreateTimer(
+                static state => ((RequestBudget)state!).OnTimer(),
+                this,
+                GetTimerSegment(timeout),
+                Timeout.InfiniteTimeSpan);
+        }
+
+        public CancellationToken ExecutionToken { get; }
+
+        public Task SignalTask => _signal.Task;
+
+        public bool HasTerminalOutcome => _callerCancellationToken.IsCancellationRequested || IsExpired;
+
+        public bool IsExpired
+        {
+            get
+            {
+                if (_timeout == TimeSpan.MaxValue)
+                {
+                    return false;
+                }
+
+                if (Volatile.Read(ref _expired) != 0)
+                {
+                    return true;
+                }
+
+                if (GetRemaining() > TimeSpan.Zero)
+                {
+                    return false;
+                }
+
+                Expire();
+                return true;
+            }
+        }
+
+        public TimeSpan GetPositiveRemainingOrThrow()
+        {
+            ThrowIfTerminal();
+            var remaining = GetRemaining();
+            if (remaining <= TimeSpan.Zero)
+            {
+                Expire();
+                throw new LogicalTimeoutException();
+            }
+
+            return remaining;
+        }
+
+        public void ThrowIfTerminal(Exception? innerException = null)
+        {
+            if (_callerCancellationToken.IsCancellationRequested)
+            {
+                ThrowCallerCancellation(_callerCancellationToken, innerException);
+            }
+
+            if (IsExpired)
+            {
+                throw new LogicalTimeoutException(innerException);
+            }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            _timer?.Dispose();
+            _signalRegistration.Dispose();
+            _linkedSource?.Dispose();
+            _deadlineSource?.Dispose();
+        }
+
+        private void OnTimer()
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            var remaining = GetRemaining();
+            if (remaining <= TimeSpan.Zero)
+            {
+                Expire();
+                return;
+            }
+
+            try
+            {
+                _timer?.Change(GetTimerSegment(remaining), Timeout.InfiniteTimeSpan);
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        private TimeSpan GetRemaining()
+        {
+            if (_timeout == TimeSpan.MaxValue)
+            {
+                return TimeSpan.MaxValue;
+            }
+
+            var elapsed = _timeProvider.GetElapsedTime(_startTimestamp);
+            return elapsed >= _timeout ? TimeSpan.Zero : _timeout - elapsed;
+        }
+
+        private void Expire()
+        {
+            if (Interlocked.Exchange(ref _expired, 1) != 0)
+            {
+                return;
+            }
+
+            try
+            {
+                _deadlineSource?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        private static TimeSpan GetTimerSegment(TimeSpan remaining)
+            => remaining <= MaximumTimerSegment ? remaining : MaximumTimerSegment;
+    }
+
+    private sealed class LogicalCircuitBreaker
+    {
+        private readonly object _gate = new();
+        private readonly string _name;
+        private readonly HttpRequestResilienceOptions _options;
+        private readonly Queue<CircuitSample> _samples = [];
+        private CircuitState _state;
+        private long _generation;
+        private long _openedTimestamp;
+        private bool _halfOpenProbeActive;
+        private int _failureCount;
+
+        public LogicalCircuitBreaker(string name, HttpRequestResilienceOptions options)
+        {
+            _name = name;
+            _options = options;
+        }
+
+        public CircuitEntry TryEnter()
+        {
+            lock (_gate)
+            {
+                var now = _options.TimeProvider.GetTimestamp();
+                if (_state == CircuitState.Closed)
+                {
+                    return CircuitEntry.AdmittedClosed(_generation);
+                }
+
+                if (_state == CircuitState.Open)
+                {
+                    var elapsed = _options.TimeProvider.GetElapsedTime(_openedTimestamp, now);
+                    if (elapsed < _options.CircuitBreakDuration)
+                    {
+                        return CircuitEntry.Rejected(_options.CircuitBreakDuration - elapsed);
+                    }
+
+                    _state = CircuitState.HalfOpen;
+                    _generation++;
+                    _halfOpenProbeActive = true;
+                    return CircuitEntry.AdmittedProbe(
+                        _generation,
+                        new HttpCircuitTelemetry(
+                            _name,
+                            HttpResilienceCircuitState.HalfOpen,
+                            null,
+                            HttpResilienceFailureCategory.CircuitOpen));
+                }
+
+                if (_halfOpenProbeActive)
+                {
+                    return CircuitEntry.Rejected(TimeSpan.Zero);
+                }
+
+                _halfOpenProbeActive = true;
+                return CircuitEntry.AdmittedProbe(_generation, transition: null);
+            }
+        }
+
+        public HttpCircuitTelemetry? Complete(CircuitEntry entry, CircuitOutcome outcome)
+        {
+            if (!entry.IsAdmitted)
+            {
+                return null;
+            }
+
+            lock (_gate)
+            {
+                if (entry.IsProbe)
+                {
+                    if (_state != CircuitState.HalfOpen || entry.Generation != _generation)
+                    {
+                        return null;
+                    }
+
+                    _halfOpenProbeActive = false;
+                    if (outcome.IsFailure)
+                    {
+                        return OpenCircuit(_options.TimeProvider.GetTimestamp(), outcome);
+                    }
+
+                    _state = CircuitState.Closed;
+                    _generation++;
+                    _samples.Clear();
+                    _failureCount = 0;
+                    return new HttpCircuitTelemetry(
+                        _name,
+                        HttpResilienceCircuitState.Closed,
+                        outcome.StatusCode,
+                        outcome.Category);
+                }
+
+                if (_state != CircuitState.Closed || entry.Generation != _generation)
+                {
+                    return null;
+                }
+
+                var now = _options.TimeProvider.GetTimestamp();
+                Prune(now);
+                _samples.Enqueue(new CircuitSample(now, outcome.IsFailure));
+                if (outcome.IsFailure)
+                {
+                    _failureCount++;
+                }
+
+                if (!outcome.IsFailure
+                    || _samples.Count < _options.CircuitMinimumThroughput
+                    || (double)_failureCount / _samples.Count < _options.CircuitFailureRatio)
+                {
+                    return null;
+                }
+
+                return OpenCircuit(now, outcome);
+            }
+        }
+
+        public void Exclude(CircuitEntry entry)
+        {
+            if (!entry.IsAdmitted || !entry.IsProbe)
+            {
+                return;
+            }
+
+            lock (_gate)
+            {
+                if (_state == CircuitState.HalfOpen && entry.Generation == _generation)
+                {
+                    _halfOpenProbeActive = false;
+                }
+            }
+        }
+
+        private HttpCircuitTelemetry OpenCircuit(long timestamp, CircuitOutcome outcome)
+        {
+            _state = CircuitState.Open;
+            _generation++;
+            _openedTimestamp = timestamp;
+            _halfOpenProbeActive = false;
+            _samples.Clear();
+            _failureCount = 0;
+            return new HttpCircuitTelemetry(
+                _name,
+                HttpResilienceCircuitState.Open,
+                outcome.StatusCode,
+                outcome.Category);
+        }
+
+        private void Prune(long now)
+        {
+            while (_samples.TryPeek(out var sample)
+                && _options.TimeProvider.GetElapsedTime(sample.Timestamp, now) >= _options.CircuitSamplingDuration)
+            {
+                _samples.Dequeue();
+                if (sample.IsFailure)
+                {
+                    _failureCount--;
+                }
+            }
+        }
+
+        private enum CircuitState
+        {
+            Closed,
+            Open,
+            HalfOpen,
+        }
+    }
+
+    private readonly record struct CircuitEntry(
+        bool IsAdmitted,
+        bool IsProbe,
+        long Generation,
+        TimeSpan RetryAfter,
+        HttpCircuitTelemetry? Transition)
+    {
+        public static CircuitEntry AdmittedClosed(long generation)
+            => new(true, false, generation, default, null);
+
+        public static CircuitEntry AdmittedProbe(long generation, HttpCircuitTelemetry? transition)
+            => new(true, true, generation, default, transition);
+
+        public static CircuitEntry Rejected(TimeSpan retryAfter)
+            => new(false, false, default, retryAfter < TimeSpan.Zero ? TimeSpan.Zero : retryAfter, null);
+    }
+
+    private readonly record struct CircuitOutcome(
+        bool IsFailure,
+        HttpStatusCode? StatusCode,
+        HttpResilienceFailureCategory Category);
+
+    private readonly record struct CircuitSample(long Timestamp, bool IsFailure);
+
     private sealed class ResponseObserverException(Exception innerException)
         : Exception("The response observer failed.", innerException);
 
-    private sealed class CircuitTimeProvider : TimeProvider
+    private sealed class LogicalTimeoutException(Exception? innerException = null)
+        : TimeoutException("The logical request budget expired.", innerException);
+
+    private static void DisposeBestEffort(IDisposable? disposable)
     {
-        private readonly object _gate = new();
-        private readonly TimeProvider _inner;
-        private readonly TimeScale _samplingScale;
-        private readonly TimeScale _openScale;
-        private long _actualAnchorTimestamp;
-        private long _virtualAnchorTicks;
-        private long _utcActualAnchorTimestamp;
-        private DateTimeOffset _virtualUtcAnchor;
-        private TimeScale _currentScale;
-
-        private CircuitTimeProvider(
-            TimeProvider inner,
-            TimeSpan samplingDuration,
-            TimeSpan breakDuration)
+        try
         {
-            _inner = inner;
-            PollySamplingDuration = ClampForPolly(samplingDuration);
-            PollyBreakDuration = ClampForPolly(breakDuration);
-            _samplingScale = new TimeScale(PollySamplingDuration.Ticks, samplingDuration.Ticks);
-            _openScale = new TimeScale(PollyBreakDuration.Ticks, breakDuration.Ticks);
-            _currentScale = _samplingScale;
-            _actualAnchorTimestamp = inner.GetTimestamp();
-            _utcActualAnchorTimestamp = _actualAnchorTimestamp;
-            _virtualUtcAnchor = CircuitUtcEpoch;
+            disposable?.Dispose();
         }
-
-        public override TimeZoneInfo LocalTimeZone => _inner.LocalTimeZone;
-
-        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
-
-        public TimeSpan PollySamplingDuration { get; }
-
-        public TimeSpan PollyBreakDuration { get; }
-
-        public static CircuitTimeProvider Create(
-            TimeProvider inner,
-            TimeSpan samplingDuration,
-            TimeSpan breakDuration)
-            => new(inner, samplingDuration, breakDuration);
-
-        public void EnterOpenState()
+        catch
         {
-            lock (_gate)
-            {
-                SwitchScale(_openScale);
-            }
-        }
-
-        public void EnterSamplingState()
-        {
-            lock (_gate)
-            {
-                SwitchScale(_samplingScale);
-            }
-        }
-
-        public override DateTimeOffset GetUtcNow()
-        {
-            lock (_gate)
-            {
-                return GetUtcNowCore();
-            }
-        }
-
-        public override long GetTimestamp()
-        {
-            lock (_gate)
-            {
-                return GetTimestampCore();
-            }
-        }
-
-        public override ITimer CreateTimer(
-            TimerCallback callback,
-            object? state,
-            TimeSpan dueTime,
-            TimeSpan period)
-            => _inner.CreateTimer(
-                callback,
-                state,
-                ToCallerDuration(dueTime),
-                ToCallerDuration(period));
-
-        private static TimeSpan ClampForPolly(TimeSpan duration)
-            => duration < PollyMinimumCircuitDuration
-                ? PollyMinimumCircuitDuration
-                : duration > PollyMaximumCircuitDuration
-                    ? PollyMaximumCircuitDuration
-                    : duration;
-
-        private long GetTimestampCore()
-        {
-            var actualTimestamp = _inner.GetTimestamp();
-            var actualElapsed = _inner.GetElapsedTime(_actualAnchorTimestamp, actualTimestamp);
-            var scaledTicks = _currentScale.ToPollyTicks(actualElapsed.Ticks, MaximumRelevantCircuitElapsedTicks);
-            _actualAnchorTimestamp = actualTimestamp;
-            _virtualAnchorTicks = unchecked(_virtualAnchorTicks + scaledTicks);
-            return _virtualAnchorTicks;
-        }
-
-        private void SwitchScale(TimeScale scale)
-        {
-            var timestamp = GetTimestampCore();
-            var utcNow = GetUtcNowCore();
-            _virtualAnchorTicks = timestamp;
-            _virtualUtcAnchor = utcNow;
-            _currentScale = scale;
-        }
-
-        private DateTimeOffset GetUtcNowCore()
-        {
-            var actualTimestamp = _inner.GetTimestamp();
-            var actualElapsed = _inner.GetElapsedTime(_utcActualAnchorTimestamp, actualTimestamp);
-            var scaledTicks = _currentScale.ToPollyTicks(actualElapsed.Ticks, MaximumRelevantCircuitElapsedTicks);
-            _utcActualAnchorTimestamp = actualTimestamp;
-            _virtualUtcAnchor += TimeSpan.FromTicks(scaledTicks);
-            return _virtualUtcAnchor;
-        }
-
-        private TimeSpan ToCallerDuration(TimeSpan duration)
-        {
-            if (duration == Timeout.InfiniteTimeSpan)
-            {
-                return duration;
-            }
-
-            TimeScale currentScale;
-            lock (_gate)
-            {
-                currentScale = _currentScale;
-            }
-
-            var unscaledTicks = currentScale.ToCallerTicks(duration.Ticks);
-            return duration > TimeSpan.Zero && unscaledTicks < 1
-                ? TimeSpan.FromTicks(1)
-                : TimeSpan.FromTicks(unscaledTicks);
-        }
-
-        private readonly record struct TimeScale(long PollyTicks, long CallerTicks)
-        {
-            public long ToPollyTicks(long callerTicks, long maximumTicks)
-            {
-                var ticks = (BigInteger)callerTicks * PollyTicks / CallerTicks;
-                return ticks >= maximumTicks ? maximumTicks : (long)ticks;
-            }
-
-            public long ToCallerTicks(long pollyTicks)
-            {
-                var dividend = (BigInteger)pollyTicks * CallerTicks;
-                var ticks = BigInteger.DivRem(dividend, PollyTicks, out var remainder);
-                if (!remainder.IsZero)
-                {
-                    ticks++;
-                }
-
-                return ticks >= TimeSpan.MaxValue.Ticks ? TimeSpan.MaxValue.Ticks : (long)ticks;
-            }
         }
     }
 

@@ -23,11 +23,13 @@ public class HttpRequestResilienceServiceCollectionExtensionsTests
         second.ShouldBeSameAs(sameSecond);
         first.ShouldNotBeSameAs(second);
 
-        using var directResponse = await SendServiceUnavailableThenOkAsync(direct);
-        using var keyedResponse = await SendServiceUnavailableThenOkAsync(first);
+        using var directResponse = await SendServiceUnavailableUntilAttemptAsync(direct, successAttempt: 2);
+        using var keyedResponse = await SendServiceUnavailableUntilAttemptAsync(first, successAttempt: 2);
+        using var secondKeyResponse = await SendServiceUnavailableUntilAttemptAsync(second, successAttempt: 3);
 
         directResponse.StatusCode.ShouldBe(HttpStatusCode.OK);
         keyedResponse.StatusCode.ShouldBe(HttpStatusCode.OK);
+        secondKeyResponse.StatusCode.ShouldBe(HttpStatusCode.OK);
     }
 
     [Theory]
@@ -74,20 +76,22 @@ public class HttpRequestResilienceServiceCollectionExtensionsTests
             JitterProvider = () => 0,
         };
 
-    private static async Task<HttpResponseMessage> SendServiceUnavailableThenOkAsync(HttpRequestResiliencePipeline pipeline)
+    private static async Task<HttpResponseMessage> SendServiceUnavailableUntilAttemptAsync(
+        HttpRequestResiliencePipeline pipeline,
+        int successAttempt)
     {
         var attempts = 0;
 
         var response = await pipeline.SendAsync(
             (attempt, _) => ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, $"https://example.test/{attempt}")),
-            (_, _, _) => Task.FromResult(++attempts == 1
+            (_, _, _) => Task.FromResult(++attempts < successAttempt
                 ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
                 : new HttpResponseMessage(HttpStatusCode.OK)),
             HttpCompletionOption.ResponseHeadersRead,
             HttpRequestReplaySafety.Replayable,
             cancellationToken: TestContext.Current.CancellationToken);
 
-        attempts.ShouldBe(2);
+        attempts.ShouldBe(successAttempt);
         return response;
     }
 }
