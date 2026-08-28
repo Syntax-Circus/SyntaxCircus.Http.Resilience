@@ -482,10 +482,11 @@ public sealed class HttpRequestResiliencePipeline
                 Task<HttpResponseMessage> senderTask;
                 try
                 {
+                    var scheduledRequest = request;
                     senderTask = Task.Run(
                         async () =>
                         {
-                            var work = sender(request, completionOption, cancellationToken)
+                            var work = sender(scheduledRequest, completionOption, cancellationToken)
                                 ?? throw new InvalidOperationException("The sender returned null task.");
                             return await work.ConfigureAwait(false)
                                 ?? throw new InvalidOperationException("The sender returned null.");
@@ -503,7 +504,7 @@ public sealed class HttpRequestResiliencePipeline
                     var completed = await Task.WhenAny(senderTask, Budget.SignalTask).ConfigureAwait(false);
                     if (completed != senderTask)
                     {
-                        _ = ObserveLateSenderAsync(senderTask, request);
+                        ScheduleLateResponseObservation(senderTask, request);
                         request = null;
                         Budget.ThrowIfTerminal();
                     }
@@ -521,7 +522,7 @@ public sealed class HttpRequestResiliencePipeline
 
                 if (Budget.HasTerminalOutcome)
                 {
-                    _ = ObserveReceivedResponseAfterTerminalAsync(response, request!);
+                    ScheduleLateResponseObservation(Task.FromResult(response), request!);
                     response = null;
                     request = null;
                     Budget.ThrowIfTerminal();
@@ -532,8 +533,9 @@ public sealed class HttpRequestResiliencePipeline
                     Task observerTask;
                     try
                     {
+                        var scheduledResponse = response!;
                         observerTask = Task.Run(
-                            async () => await responseObserver(response!, cancellationToken).ConfigureAwait(false),
+                            async () => await responseObserver(scheduledResponse, cancellationToken).ConfigureAwait(false),
                             CancellationToken.None);
                     }
                     catch (Exception exception)
@@ -666,57 +668,38 @@ public sealed class HttpRequestResiliencePipeline
             }
         }
 
-        private async Task ObserveLateSenderAsync(
+        private void ScheduleLateResponseObservation(
             Task<HttpResponseMessage> senderTask,
             HttpRequestMessage request)
         {
-            HttpResponseMessage? response = null;
-            try
-            {
-                response = await senderTask.ConfigureAwait(false);
-                if (response is not null && responseObserver is not null)
+            _ = Task.Run(
+                async () =>
                 {
+                    HttpResponseMessage? response = null;
                     try
                     {
-                        await responseObserver(response, Budget.ExecutionToken).ConfigureAwait(false);
+                        response = await senderTask.ConfigureAwait(false);
+                        if (response is not null && responseObserver is not null)
+                        {
+                            try
+                            {
+                                await responseObserver(response, Budget.ExecutionToken).ConfigureAwait(false);
+                            }
+                            catch
+                            {
+                            }
+                        }
                     }
                     catch
                     {
                     }
-                }
-            }
-            catch
-            {
-            }
-            finally
-            {
-                DisposeBestEffort(response);
-                DisposeBestEffort(request);
-            }
-        }
-
-        private async Task ObserveReceivedResponseAfterTerminalAsync(
-            HttpResponseMessage response,
-            HttpRequestMessage request)
-        {
-            try
-            {
-                if (responseObserver is not null)
-                {
-                    try
+                    finally
                     {
-                        await responseObserver(response, Budget.ExecutionToken).ConfigureAwait(false);
+                        DisposeBestEffort(response);
+                        DisposeBestEffort(request);
                     }
-                    catch
-                    {
-                    }
-                }
-            }
-            finally
-            {
-                DisposeBestEffort(response);
-                DisposeBestEffort(request);
-            }
+                },
+                CancellationToken.None);
         }
 
         private static async Task ObserveLateObserverAsync(
