@@ -181,7 +181,8 @@ public sealed class HttpRequestResiliencePipeline
             completionOption,
             replaySafety,
             responseObserver,
-            _options.TimeProvider.GetTimestamp());
+            _options.TimeProvider.GetTimestamp(),
+            cancellationToken);
         using var timeoutSource = _options.TotalRequestTimeout == TimeSpan.MaxValue
             ? null
             : new CancellationTokenSource(_options.TotalRequestTimeout, _options.TimeProvider);
@@ -426,7 +427,8 @@ public sealed class HttpRequestResiliencePipeline
         HttpCompletionOption completionOption,
         HttpRequestReplaySafety replaySafety,
         Func<HttpResponseMessage, CancellationToken, ValueTask>? responseObserver,
-        long startTimestamp)
+        long startTimestamp,
+        CancellationToken callerCancellationToken)
     {
         private HttpResponseMessage? _pendingResponse;
         private int _attemptNumber;
@@ -458,11 +460,27 @@ public sealed class HttpRequestResiliencePipeline
                         DisposePendingResponseBestEffort();
                         DisposeBestEffort(request);
                         request = null;
+                        if (callerCancellationToken.IsCancellationRequested)
+                        {
+                            throw new OperationCanceledException("The operation was canceled.", exception, callerCancellationToken);
+                        }
+
                         throw new ResponseObserverException(exception);
                     }
                 }
 
+                if (callerCancellationToken.IsCancellationRequested)
+                {
+                    DisposePendingResponseBestEffort();
+                    throw new OperationCanceledException(callerCancellationToken);
+                }
+
                 return new AttemptResult(response, this);
+            }
+            catch (Exception exception) when (callerCancellationToken.IsCancellationRequested)
+            {
+                DisposePendingResponseBestEffort();
+                throw new OperationCanceledException("The operation was canceled.", exception, callerCancellationToken);
             }
             finally
             {

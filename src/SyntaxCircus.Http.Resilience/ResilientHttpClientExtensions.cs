@@ -108,6 +108,12 @@ internal static class HttpResilienceOutcomeClassifier
         CancellationToken cancellationToken,
         out HttpResilienceFailureCategory category)
     {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            category = HttpResilienceFailureCategory.Timeout;
+            return false;
+        }
+
         if (exception is HttpRequestException)
         {
             category = HttpResilienceFailureCategory.Transport;

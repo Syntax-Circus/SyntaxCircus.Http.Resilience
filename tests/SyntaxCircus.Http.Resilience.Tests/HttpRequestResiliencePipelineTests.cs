@@ -625,6 +625,134 @@ public class HttpRequestResiliencePipelineTests
     }
 
     [Fact]
+    public async Task SendAsync_SenderCancelsCallerThenReturnsRetryableResponse_ObservesDisposesAndDoesNotPolluteRetryOrCircuit()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var sends = 0;
+        var observerCalls = 0;
+        var followingSends = 0;
+        var retryEvents = new List<HttpRetryTelemetry>();
+        var circuitEvents = new List<HttpCircuitTelemetry>();
+        var responseContent = new ThrowingDisposeContent(new InvalidOperationException("response cleanup"));
+        var pipeline = CreatePipeline(
+            new ManualTimeProvider(),
+            circuitMinimumThroughput: 2,
+            onRetry: (telemetry, _) => { retryEvents.Add(telemetry); return ValueTask.CompletedTask; },
+            onCircuit: (telemetry, _) => { circuitEvents.Add(telemetry); return ValueTask.CompletedTask; });
+
+        var actual = await Should.ThrowAsync<OperationCanceledException>(() => pipeline.SendAsync(
+            (attempt, _) => ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, $"https://example.test/{attempt}")),
+            (_, _, _) =>
+            {
+                sends++;
+                cancellation.Cancel();
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                {
+                    Content = responseContent,
+                });
+            },
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            (_, _) =>
+            {
+                observerCalls++;
+                return ValueTask.CompletedTask;
+            },
+            cancellation.Token));
+
+        using var following = await SendAsync(
+            pipeline,
+            (_, _, _) =>
+            {
+                followingSends++;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+            },
+            HttpRequestReplaySafety.NotReplayable);
+
+        actual.CancellationToken.ShouldBe(cancellation.Token);
+        sends.ShouldBe(1);
+        observerCalls.ShouldBe(1);
+        responseContent.DisposeAttempted.ShouldBeTrue();
+        retryEvents.ShouldBeEmpty();
+        circuitEvents.ShouldBeEmpty();
+        followingSends.ShouldBe(1);
+        following.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task SendAsync_SenderCancelsCallerThenObserverThrows_CallerCancellationWinsAndCleanupIsAttempted()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var observerCalls = 0;
+        var responseContent = new ThrowingDisposeContent(new InvalidOperationException("response cleanup"));
+        var pipeline = CreatePipeline(new ManualTimeProvider());
+
+        var actual = await Should.ThrowAsync<OperationCanceledException>(() => pipeline.SendAsync(
+            (_, _) => ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, "https://example.test/cancel")),
+            (_, _, _) =>
+            {
+                cancellation.Cancel();
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                {
+                    Content = responseContent,
+                });
+            },
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            (_, _) =>
+            {
+                observerCalls++;
+                throw new InvalidOperationException("observer");
+            },
+            cancellation.Token));
+
+        actual.CancellationToken.ShouldBe(cancellation.Token);
+        observerCalls.ShouldBe(1);
+        responseContent.DisposeAttempted.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task SendAsync_SenderCancelsCallerThenThrowsTransport_CallerCancellationWinsWithoutRetryOrCircuitPollution()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var sends = 0;
+        var followingSends = 0;
+        var retryEvents = new List<HttpRetryTelemetry>();
+        var circuitEvents = new List<HttpCircuitTelemetry>();
+        var pipeline = CreatePipeline(
+            new ManualTimeProvider(),
+            circuitMinimumThroughput: 2,
+            onRetry: (telemetry, _) => { retryEvents.Add(telemetry); return ValueTask.CompletedTask; },
+            onCircuit: (telemetry, _) => { circuitEvents.Add(telemetry); return ValueTask.CompletedTask; });
+
+        var actual = await Should.ThrowAsync<OperationCanceledException>(() => SendAsyncWithCancellation(
+            pipeline,
+            (_, _, _) =>
+            {
+                sends++;
+                cancellation.Cancel();
+                return Task.FromException<HttpResponseMessage>(new HttpRequestException("transport"));
+            },
+            cancellation.Token));
+
+        using var following = await SendAsync(
+            pipeline,
+            (_, _, _) =>
+            {
+                followingSends++;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+            },
+            HttpRequestReplaySafety.NotReplayable);
+
+        actual.CancellationToken.ShouldBe(cancellation.Token);
+        sends.ShouldBe(1);
+        retryEvents.ShouldBeEmpty();
+        circuitEvents.ShouldBeEmpty();
+        followingSends.ShouldBe(1);
+        following.StatusCode.ShouldBe(HttpStatusCode.OK);
+    }
+
+    [Fact]
     public async Task SendAsync_ThrowingRequestCleanupCannotReplaceCallerCancellationAndPipelineRemainsHealthy()
     {
         using var cancellation = new CancellationTokenSource();
