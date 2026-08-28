@@ -198,7 +198,7 @@ public sealed class HttpRequestResiliencePipeline
         }
         catch (ResponseObserverException exception)
         {
-            state.DisposePendingResponse();
+            state.DisposePendingResponseBestEffort();
             ExceptionDispatchInfo.Capture(exception.InnerException!).Throw();
             throw;
         }
@@ -392,26 +392,35 @@ public sealed class HttpRequestResiliencePipeline
         public async ValueTask<AttemptResult> SendAttemptAsync(CancellationToken cancellationToken)
         {
             var attemptNumber = Interlocked.Increment(ref _attemptNumber);
-            using var request = await requestFactory(attemptNumber, cancellationToken).ConfigureAwait(false)
+            HttpRequestMessage? request = await requestFactory(attemptNumber, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException("The request factory returned null.");
-            var response = await sender(request, completionOption, cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException("The sender returned null.");
-            Volatile.Write(ref _pendingResponse, response);
-
-            if (responseObserver is not null)
+            try
             {
-                try
-                {
-                    await responseObserver(response, cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception exception)
-                {
-                    DisposePendingResponse();
-                    throw new ResponseObserverException(exception);
-                }
-            }
+                var response = await sender(request, completionOption, cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("The sender returned null.");
+                Volatile.Write(ref _pendingResponse, response);
 
-            return new AttemptResult(response, this);
+                if (responseObserver is not null)
+                {
+                    try
+                    {
+                        await responseObserver(response, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception exception)
+                    {
+                        DisposePendingResponseBestEffort();
+                        DisposeBestEffort(request);
+                        request = null;
+                        throw new ResponseObserverException(exception);
+                    }
+                }
+
+                return new AttemptResult(response, this);
+            }
+            finally
+            {
+                request?.Dispose();
+            }
         }
 
         public void ReleaseResponse(HttpResponseMessage response)
@@ -422,6 +431,23 @@ public sealed class HttpRequestResiliencePipeline
         public void DisposePendingResponse()
         {
             Interlocked.Exchange(ref _pendingResponse, null)?.Dispose();
+        }
+
+        public void DisposePendingResponseBestEffort()
+        {
+            DisposeBestEffort(Interlocked.Exchange(ref _pendingResponse, null));
+        }
+
+        private static void DisposeBestEffort(IDisposable? disposable)
+        {
+            try
+            {
+                disposable?.Dispose();
+            }
+            catch
+            {
+                // Observer failures own the outcome; cleanup must not replace or classify them.
+            }
         }
     }
 

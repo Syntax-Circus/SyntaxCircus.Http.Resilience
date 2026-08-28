@@ -280,6 +280,91 @@ public class HttpRequestResiliencePipelineTests
     }
 
     [Fact]
+    public async Task SendAsync_ResponseObserverFailure_PreservesOriginalWhenRequestAndResponseDisposalThrow()
+    {
+        var observerSends = 0;
+        var followingSends = 0;
+        var requestContents = new List<ThrowingDisposeContent>();
+        var responseContents = new List<ThrowingDisposeContent>();
+        using var observerCancellation = new CancellationTokenSource();
+        var observerException = new OperationCanceledException("observer sentinel", observerCancellation.Token);
+        var pipeline = new HttpRequestResiliencePipeline("test", new HttpRequestResilienceOptions
+        {
+            MaxAttempts = 2,
+            TotalRequestTimeout = TimeSpan.FromSeconds(5),
+            BackoffBaseDelay = TimeSpan.FromMilliseconds(1),
+            MaximumDelay = TimeSpan.FromMilliseconds(1),
+            CircuitFailureRatio = 1,
+            CircuitMinimumThroughput = 2,
+            CircuitSamplingDuration = TimeSpan.FromSeconds(30),
+            CircuitBreakDuration = TimeSpan.FromSeconds(5),
+            TimeProvider = TimeProvider.System,
+            JitterProvider = () => 0,
+        });
+
+        using (var primer = await SendAsync(
+            pipeline,
+            (_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)),
+            HttpRequestReplaySafety.NotReplayable))
+        {
+            primer.StatusCode.ShouldBe(HttpStatusCode.ServiceUnavailable);
+        }
+
+        var actual = await Record.ExceptionAsync(() => pipeline.SendAsync(
+            (attempt, _) =>
+            {
+                var content = new ThrowingDisposeContent(new HttpRequestException("request cleanup"));
+                requestContents.Add(content);
+                return ValueTask.FromResult(new HttpRequestMessage(HttpMethod.Get, $"https://example.test/{attempt}")
+                {
+                    Content = content,
+                });
+            },
+            (_, _, _) =>
+            {
+                observerSends++;
+                var content = new ThrowingDisposeContent(new HttpRequestException("response cleanup"));
+                responseContents.Add(content);
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+            },
+            HttpCompletionOption.ResponseHeadersRead,
+            HttpRequestReplaySafety.Replayable,
+            (_, _) => throw observerException,
+            TestContext.Current.CancellationToken));
+
+        HttpResponseMessage? followingResponse = null;
+        var followingFailure = await Record.ExceptionAsync(async () =>
+        {
+            followingResponse = await SendAsync(
+                pipeline,
+                (_, _, _) =>
+                {
+                    followingSends++;
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+                },
+                HttpRequestReplaySafety.NotReplayable);
+        });
+
+        try
+        {
+            actual.ShouldBeSameAs(observerException);
+            actual.ShouldBeOfType<OperationCanceledException>().CancellationToken.ShouldBe(observerCancellation.Token);
+            observerSends.ShouldBe(1);
+            requestContents.Count.ShouldBe(1);
+            responseContents.Count.ShouldBe(1);
+            requestContents[0].DisposeAttempted.ShouldBeTrue();
+            responseContents[0].DisposeAttempted.ShouldBeTrue();
+            followingFailure.ShouldBeNull();
+            followingSends.ShouldBe(1);
+            followingResponse.ShouldNotBeNull().StatusCode.ShouldBe(HttpStatusCode.OK);
+        }
+        finally
+        {
+            followingResponse?.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task SendAsync_MaxValueTotalBudget_HasNoDeadline()
     {
         var sends = 0;
@@ -856,6 +941,26 @@ public class HttpRequestResiliencePipelineTests
         {
             Disposed = disposing;
             base.Dispose(disposing);
+        }
+    }
+
+    private sealed class ThrowingDisposeContent(Exception exception) : HttpContent
+    {
+        public bool DisposeAttempted { get; private set; }
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => Task.CompletedTask;
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return true;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            DisposeAttempted = disposing;
+            base.Dispose(disposing);
+            throw exception;
         }
     }
 
