@@ -49,7 +49,7 @@ public sealed class ReleaseWorkflowPolicyTests
         buildStart.ShouldBeGreaterThanOrEqualTo(0);
         packStart.ShouldBeGreaterThan(buildStart);
         Workflow[buildStart..packStart].ShouldContain("-p:GenerateDocumentationFile=true");
-        Workflow[buildStart..packStart].ShouldContain("'-p:NoWarn=CS1591;CS1573'");
+        Workflow[buildStart..packStart].ShouldContain("-p:NoWarn=CA1305%3BCA1707%3BCA1848%3BCS1591%3BCS1573");
     }
 
     [Fact]
