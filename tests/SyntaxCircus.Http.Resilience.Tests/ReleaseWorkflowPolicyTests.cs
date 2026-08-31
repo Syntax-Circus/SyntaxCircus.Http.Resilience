@@ -22,6 +22,9 @@ public sealed class ReleaseWorkflowPolicyTests
         Workflow.ShouldContain("version:");
         Workflow.ShouldContain("source_sha:");
         Workflow.ShouldContain("0.2.0-cmsify.1");
+        Workflow.ShouldContain("github.ref == 'refs/heads/main'");
+        Workflow.ShouldContain("format('http-resilience-release-{0}', inputs.version)");
+        Workflow.ShouldContain("cancel-in-progress: false");
         Workflow.ShouldContain("git merge-base --is-ancestor \"$SOURCE_SHA\" origin/main");
         Workflow.ShouldContain("test \"$(git rev-parse HEAD)\" = \"$SOURCE_SHA\"");
     }
