@@ -90,6 +90,26 @@ public class ResilientHttpClientExtensionsTests
     }
 
     [Fact]
+    public async Task SendAsync_RequestTimeoutIsRetried()
+    {
+        var (client, handler) = BuildClient(_ => new HttpResponseMessage(HttpStatusCode.RequestTimeout), retryCount: 1);
+
+        await client.GetAsync(new Uri("https://example.test/things"), TestContext.Current.CancellationToken);
+
+        handler.CallCount.ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task SendAsync_UndocumentedServerErrorIsNotRetried()
+    {
+        var (client, handler) = BuildClient(_ => new HttpResponseMessage(HttpStatusCode.NotImplemented), retryCount: 2);
+
+        await client.GetAsync(new Uri("https://example.test/things"), TestContext.Current.CancellationToken);
+
+        handler.CallCount.ShouldBe(1);
+    }
+
+    [Fact]
     public async Task SendAsync_AiModeFalse_TooManyRequestsIsRetried()
     {
         var (client, handler) = BuildClient(_ => new HttpResponseMessage(HttpStatusCode.TooManyRequests), retryCount: 2, aiMode: false);

@@ -10,7 +10,7 @@ public static class ResilientHttpClientExtensions
 {
     /// <summary>
     /// Registers a named <see cref="HttpClient"/> with retry + circuit-breaker resilience
-    /// (exponential backoff with jitter, retrying transient errors and 429/5xx).
+    /// (exponential backoff with jitter, retrying transport/timeouts and the shared transient HTTP status set).
     /// <paramref name="aiMode"/> excludes 429 (rate-limited) from retry/circuit-breaking — useful
     /// for AI/LLM provider clients, where a 429 means "back off on purpose", not "something's broken".
     /// </summary>
@@ -47,7 +47,10 @@ public static class ResilientHttpClientExtensions
                 MaxRetryAttempts = retryCount,
                 BackoffType = DelayBackoffType.Exponential,
                 UseJitter = true,
-                ShouldHandle = args => ValueTask.FromResult(ShouldHandle(args.Outcome, aiMode)),
+                ShouldHandle = args => ValueTask.FromResult(HttpResilienceOutcomeClassifier.ShouldHandle(
+                    args.Outcome,
+                    includeTooManyRequests: !aiMode,
+                    args.Context.CancellationToken)),
                 OnRetry = args =>
                 {
                     onRetry?.Invoke(name, args.AttemptNumber + 1, args.Outcome.Result?.StatusCode);
@@ -60,7 +63,10 @@ public static class ResilientHttpClientExtensions
                 FailureRatio = 0.5,
                 MinimumThroughput = 5,
                 BreakDuration = TimeSpan.FromSeconds(30),
-                ShouldHandle = args => ValueTask.FromResult(ShouldHandle(args.Outcome, aiMode)),
+                ShouldHandle = args => ValueTask.FromResult(HttpResilienceOutcomeClassifier.ShouldHandle(
+                    args.Outcome,
+                    includeTooManyRequests: !aiMode,
+                    args.Context.CancellationToken)),
                 OnOpened = args =>
                 {
                     onBreak?.Invoke(name, args.Outcome.Result?.StatusCode);
@@ -71,25 +77,57 @@ public static class ResilientHttpClientExtensions
 
         return builder;
     }
+}
 
-    private static bool ShouldHandle(Outcome<HttpResponseMessage> outcome, bool aiMode)
+internal static class HttpResilienceOutcomeClassifier
+{
+    private static readonly IReadOnlySet<HttpStatusCode> RetryableStatusCodesWithoutTooManyRequests =
+        HttpRequestResilienceOptions.DefaultRetryableStatusCodes
+            .Where(statusCode => statusCode != HttpStatusCode.TooManyRequests)
+            .ToHashSet();
+
+    public static bool ShouldHandle(
+        Outcome<HttpResponseMessage> outcome,
+        bool includeTooManyRequests,
+        CancellationToken cancellationToken)
+        => TryClassify(
+            outcome.Result,
+            outcome.Exception,
+            includeTooManyRequests
+                ? HttpRequestResilienceOptions.DefaultRetryableStatusCodes
+                : RetryableStatusCodesWithoutTooManyRequests,
+            HttpRequestResilienceOptions.DefaultRetryableExceptionCategories,
+            cancellationToken,
+            out _);
+
+    public static bool TryClassify(
+        HttpResponseMessage? response,
+        Exception? exception,
+        IReadOnlySet<HttpStatusCode> retryableStatusCodes,
+        IReadOnlySet<HttpResilienceFailureCategory> retryableExceptionCategories,
+        CancellationToken cancellationToken,
+        out HttpResilienceFailureCategory category)
     {
-        if (outcome.Exception is not null)
+        if (cancellationToken.IsCancellationRequested)
         {
-            return true;
-        }
-
-        var statusCode = outcome.Result?.StatusCode;
-        if (statusCode is null)
-        {
+            category = HttpResilienceFailureCategory.Timeout;
             return false;
         }
 
-        if (statusCode == HttpStatusCode.TooManyRequests)
+        if (exception is HttpRequestException)
         {
-            return !aiMode;
+            category = HttpResilienceFailureCategory.Transport;
+            return retryableExceptionCategories.Contains(category);
         }
 
-        return (int)statusCode >= 500;
+        if (exception is TimeoutException
+            || exception is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+        {
+            category = HttpResilienceFailureCategory.Timeout;
+            return retryableExceptionCategories.Contains(category);
+        }
+
+        category = HttpResilienceFailureCategory.HttpStatus;
+        return response is not null && retryableStatusCodes.Contains(response.StatusCode);
     }
 }
