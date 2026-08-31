@@ -70,7 +70,7 @@ jobs:
       - name: Restore, build, and test candidate source
         run: |
           dotnet restore SyntaxCircus.Http.Resilience.slnx
-          dotnet build SyntaxCircus.Http.Resilience.slnx --configuration Release --no-restore -p:DisableGitVersionTask=true --verbosity minimal
+          dotnet build SyntaxCircus.Http.Resilience.slnx --configuration Release --no-restore -p:DisableGitVersionTask=true -p:GenerateDocumentationFile=true --verbosity minimal
           dotnet test --solution SyntaxCircus.Http.Resilience.slnx --configuration Release --no-build -p:DisableGitVersionTask=true --verbosity minimal
       - name: Pack exact candidate once
         shell: bash

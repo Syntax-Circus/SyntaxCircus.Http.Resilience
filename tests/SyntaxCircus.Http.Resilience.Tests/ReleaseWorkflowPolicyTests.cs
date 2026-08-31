@@ -41,6 +41,17 @@ public sealed class ReleaseWorkflowPolicyTests
     }
 
     [Fact]
+    public void Candidate_build_generates_documentation_required_by_no_build_pack()
+    {
+        var buildStart = Workflow.IndexOf("- name: Restore, build, and test candidate source", StringComparison.Ordinal);
+        var packStart = Workflow.IndexOf("- name: Pack exact candidate once", StringComparison.Ordinal);
+
+        buildStart.ShouldBeGreaterThanOrEqualTo(0);
+        packStart.ShouldBeGreaterThan(buildStart);
+        Workflow[buildStart..packStart].ShouldContain("-p:GenerateDocumentationFile=true");
+    }
+
+    [Fact]
     public void Actions_are_immutable_and_local_script_cannot_publish()
     {
         var actionReferences = Regex.Matches(Workflow, @"uses:\s*[^\s]+@(?<reference>[^\s#]+)");
