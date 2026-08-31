@@ -23,7 +23,6 @@ public class HttpRequestResilienceCriticalFix3Tests
                 return ValueTask.CompletedTask;
             });
         using var cancellation = new CancellationTokenSource();
-        using var continuationGate = new ExecutionContextGate();
         using var releaseObserver = new BlockingGate();
         var senderEntered = NewSignal();
         var senderCompletion = new TaskCompletionSource<HttpResponseMessage>();
@@ -41,10 +40,7 @@ public class HttpRequestResilienceCriticalFix3Tests
         HttpResponseMessage? observedResponse = null;
         var observerCalls = 0;
 
-        Task<HttpResponseMessage> operation;
-        using (continuationGate.Install())
-        {
-            operation = pipeline.SendAsync(
+        var operation = pipeline.SendAsync(
                 (_, _) => ValueTask.FromResult(originalRequest),
                 (_, _, _) =>
                 {
@@ -62,20 +58,17 @@ public class HttpRequestResilienceCriticalFix3Tests
                     return ValueTask.CompletedTask;
                 },
                 cancellation.Token);
-        }
 
         await senderEntered.Task.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
-        continuationGate.Arm(ignoreCurrentThread: true);
         cancellation.Cancel();
-        await continuationGate.Entered.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
+        var failure = await CaptureAsync(operation);
         senderCompletion.SetResult(originalResponse);
-        continuationGate.Release();
 
         await observerEntered.Task.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
         requestContent.Disposed.ShouldBeFalse();
         responseContent.Disposed.ShouldBeFalse();
 
-        var failure = await CaptureBeforeReleaseAsync(operation, releaseObserver);
+        releaseObserver.Release();
         await Task.WhenAll(requestContent.DisposedTask, responseContent.DisposedTask)
             .WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
 
@@ -106,7 +99,6 @@ public class HttpRequestResilienceCriticalFix3Tests
                 Interlocked.Increment(ref circuitCalls);
                 return ValueTask.CompletedTask;
             });
-        using var continuationGate = new ExecutionContextGate();
         using var releaseObserver = new BlockingGate();
         var senderEntered = NewSignal();
         var senderCompletion = new TaskCompletionSource<HttpResponseMessage>();
@@ -124,10 +116,7 @@ public class HttpRequestResilienceCriticalFix3Tests
         HttpResponseMessage? observedResponse = null;
         var observerCalls = 0;
 
-        Task<HttpResponseMessage> operation;
-        using (continuationGate.Install())
-        {
-            operation = pipeline.SendAsync(
+        var operation = pipeline.SendAsync(
                 (_, _) => ValueTask.FromResult(originalRequest),
                 (_, _, _) =>
                 {
@@ -145,20 +134,17 @@ public class HttpRequestResilienceCriticalFix3Tests
                     return ValueTask.CompletedTask;
                 },
                 TestContext.Current.CancellationToken);
-        }
 
         await senderEntered.Task.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
-        continuationGate.Arm(ignoreCurrentThread: true);
         timeProvider.Advance(TimeSpan.FromSeconds(1));
-        await continuationGate.Entered.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
+        var failure = await CaptureAsync(operation);
         senderCompletion.SetResult(originalResponse);
-        continuationGate.Release();
 
         await observerEntered.Task.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
         requestContent.Disposed.ShouldBeFalse();
         responseContent.Disposed.ShouldBeFalse();
 
-        var failure = await CaptureBeforeReleaseAsync(operation, releaseObserver);
+        releaseObserver.Release();
         await Task.WhenAll(requestContent.DisposedTask, responseContent.DisposedTask)
             .WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
 
@@ -170,12 +156,12 @@ public class HttpRequestResilienceCriticalFix3Tests
     }
 
     [Fact]
-    public async Task SendAsync_QueuedSenderReceivesStableRequestAfterCancellationTransfersOwnership()
+    public async Task SendAsync_BlockedSenderReceivesStableRequestAfterCancellationTransfersOwnership()
     {
         var timeProvider = new ManualTimeProvider();
         var pipeline = CreatePipeline(timeProvider);
         using var cancellation = new CancellationTokenSource();
-        using var senderGate = new ExecutionContextGate();
+        using var senderGate = new BlockingGate();
         var requestContent = new TrackingContent();
         var responseContent = new TrackingContent();
         using var originalRequest = new HttpRequestMessage(HttpMethod.Get, "https://example.test/queued-sender")
@@ -187,19 +173,18 @@ public class HttpRequestResilienceCriticalFix3Tests
             Content = responseContent,
         };
         HttpRequestMessage? receivedRequest = null;
+        var senderEntered = NewSignal();
         var senderFinished = NewSignal();
 
-        Task<HttpResponseMessage> operation;
-        using (senderGate.Install())
-        {
-            operation = pipeline.SendAsync(
+        var operation = pipeline.SendAsync(
                 (_, _) =>
                 {
-                    senderGate.Arm(entriesToSkip: 1);
                     return ValueTask.FromResult(originalRequest);
                 },
                 (request, _, _) =>
                 {
+                    senderEntered.TrySetResult();
+                    senderGate.Wait();
                     receivedRequest = request;
                     senderFinished.TrySetResult();
                     return Task.FromResult(originalResponse);
@@ -207,9 +192,8 @@ public class HttpRequestResilienceCriticalFix3Tests
                 HttpCompletionOption.ResponseHeadersRead,
                 HttpRequestReplaySafety.Replayable,
                 cancellationToken: cancellation.Token);
-        }
 
-        await senderGate.Entered.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
+        await senderEntered.Task.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
         receivedRequest.ShouldBeNull();
         cancellation.Cancel();
 
@@ -235,11 +219,11 @@ public class HttpRequestResilienceCriticalFix3Tests
     }
 
     [Fact]
-    public async Task SendAsync_QueuedObserverReceivesStableResponseAfterDeadlineTransfersOwnership()
+    public async Task SendAsync_BlockedObserverReceivesStableResponseAfterDeadlineTransfersOwnership()
     {
         var timeProvider = new ManualTimeProvider();
         var pipeline = CreatePipeline(timeProvider, TimeSpan.FromSeconds(1));
-        using var observerGate = new ExecutionContextGate();
+        using var observerGate = new BlockingGate();
         var requestContent = new TrackingContent();
         var responseContent = new TrackingContent();
         using var originalRequest = new HttpRequestMessage(HttpMethod.Get, "https://example.test/queued-observer")
@@ -252,31 +236,26 @@ public class HttpRequestResilienceCriticalFix3Tests
         };
         HttpResponseMessage? receivedResponse = null;
         var observerCalls = 0;
+        var observerEntered = NewSignal();
         var observerFinished = NewSignal();
 
-        Task<HttpResponseMessage> operation;
-        using (observerGate.Install())
-        {
-            operation = pipeline.SendAsync(
+        var operation = pipeline.SendAsync(
                 (_, _) => ValueTask.FromResult(originalRequest),
-                (_, _, _) =>
-                {
-                    observerGate.Arm(entriesToSkip: 1);
-                    return Task.FromResult(originalResponse);
-                },
+                (_, _, _) => Task.FromResult(originalResponse),
                 HttpCompletionOption.ResponseHeadersRead,
                 HttpRequestReplaySafety.Replayable,
                 (response, _) =>
                 {
+                    observerEntered.TrySetResult();
+                    observerGate.Wait();
                     receivedResponse = response;
                     Interlocked.Increment(ref observerCalls);
                     observerFinished.TrySetResult();
                     return ValueTask.CompletedTask;
                 },
                 TestContext.Current.CancellationToken);
-        }
 
-        await observerGate.Entered.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
+        await observerEntered.Task.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
         observerCalls.ShouldBe(0);
         timeProvider.Advance(TimeSpan.FromSeconds(1));
 
@@ -318,20 +297,6 @@ public class HttpRequestResilienceCriticalFix3Tests
             OnTimeout = onTimeout,
             OnCircuitStateChanged = onCircuit,
         });
-
-    private static async Task<Exception?> CaptureBeforeReleaseAsync(
-        Task<HttpResponseMessage> operation,
-        BlockingGate release)
-    {
-        try
-        {
-            return await CaptureAsync(operation);
-        }
-        finally
-        {
-            release.Release();
-        }
-    }
 
     private static async Task<Exception?> CaptureAsync(Task<HttpResponseMessage> operation)
         => await Record.ExceptionAsync(async () =>
@@ -382,95 +347,6 @@ public class HttpRequestResilienceCriticalFix3Tests
             Interlocked.Exchange(ref _isDisposed, 1);
             _disposed.TrySetResult();
             base.Dispose(disposing);
-        }
-    }
-
-    private sealed class ExecutionContextGate : IDisposable
-    {
-        private static readonly AsyncLocal<ExecutionContextGate?> Current = new(OnContextChanged);
-
-        private readonly ManualResetEventSlim _release = new();
-        private readonly TaskCompletionSource _entered = NewSignal();
-        private int _armed;
-        private int _armingThreadId;
-        private int _entriesToSkip;
-        private int _used;
-
-        public Task Entered => _entered.Task;
-
-        public IDisposable Install()
-        {
-            var previous = Current.Value;
-            Current.Value = this;
-            return new Scope(previous);
-        }
-
-        public void Arm(bool ignoreCurrentThread = false, int entriesToSkip = 0)
-        {
-            ArgumentOutOfRangeException.ThrowIfNegative(entriesToSkip);
-            Volatile.Write(
-                ref _armingThreadId,
-                ignoreCurrentThread ? Environment.CurrentManagedThreadId : -1);
-            Volatile.Write(ref _entriesToSkip, entriesToSkip);
-            Volatile.Write(ref _armed, 1);
-        }
-
-        public void Release() => _release.Set();
-
-        public void Dispose()
-        {
-            _release.Set();
-            _release.Dispose();
-        }
-
-        private static void OnContextChanged(AsyncLocalValueChangedArgs<ExecutionContextGate?> args)
-        {
-            var gate = args.CurrentValue;
-            if (!args.ThreadContextChanged
-                || gate is null
-                || Volatile.Read(ref gate._armed) == 0
-                || Environment.CurrentManagedThreadId == Volatile.Read(ref gate._armingThreadId))
-            {
-                return;
-            }
-
-            while (true)
-            {
-                var entriesToSkip = Volatile.Read(ref gate._entriesToSkip);
-                if (entriesToSkip == 0)
-                {
-                    break;
-                }
-
-                if (Interlocked.CompareExchange(
-                    ref gate._entriesToSkip,
-                    entriesToSkip - 1,
-                    entriesToSkip) == entriesToSkip)
-                {
-                    return;
-                }
-            }
-
-            if (Interlocked.CompareExchange(ref gate._used, 1, 0) != 0)
-            {
-                return;
-            }
-
-            gate._entered.TrySetResult();
-            gate._release.Wait(CancellationToken.None);
-        }
-
-        private sealed class Scope(ExecutionContextGate? previous) : IDisposable
-        {
-            private int _disposed;
-
-            public void Dispose()
-            {
-                if (Interlocked.Exchange(ref _disposed, 1) == 0)
-                {
-                    Current.Value = previous;
-                }
-            }
         }
     }
 

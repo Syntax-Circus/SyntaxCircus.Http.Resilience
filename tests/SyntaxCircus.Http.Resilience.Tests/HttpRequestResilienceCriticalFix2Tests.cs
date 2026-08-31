@@ -248,11 +248,14 @@ public class HttpRequestResilienceCriticalFix2Tests
 
         await senderEntered.Task.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
         timeProvider.Advance(TimeSpan.FromSeconds(1));
-        var promptFailureTask = CaptureBeforeReleaseAsync(operation, releaseSender);
-        await Task.Yield();
-        requestContent.Disposed.ShouldBeFalse();
-        responseContent.Disposed.ShouldBeFalse();
-        var promptFailure = await promptFailureTask;
+        var promptFailure = await CaptureBeforeReleaseAsync(
+            operation,
+            releaseSender,
+            () =>
+            {
+                requestContent.Disposed.ShouldBeFalse();
+                responseContent.Disposed.ShouldBeFalse();
+            });
         await WaitForConditionAsync(() =>
             requestContent.Disposed
             && responseContent.Disposed
@@ -304,11 +307,14 @@ public class HttpRequestResilienceCriticalFix2Tests
 
         await observerEntered.Task.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
         timeProvider.Advance(TimeSpan.FromSeconds(1));
-        var promptFailureTask = CaptureBeforeReleaseAsync(operation, releaseObserver);
-        await Task.Yield();
-        requestContent.Disposed.ShouldBeFalse();
-        responseContent.Disposed.ShouldBeFalse();
-        var promptFailure = await promptFailureTask;
+        var promptFailure = await CaptureBeforeReleaseAsync(
+            operation,
+            releaseObserver,
+            () =>
+            {
+                requestContent.Disposed.ShouldBeFalse();
+                responseContent.Disposed.ShouldBeFalse();
+            });
         await WaitForConditionAsync(() => requestContent.Disposed && responseContent.Disposed);
         await ObserveAndDisposeResponseAsync(operation);
 
@@ -466,16 +472,19 @@ public class HttpRequestResilienceCriticalFix2Tests
 
     private static async Task<Exception?> CaptureBeforeReleaseAsync(
         Task<HttpResponseMessage> operation,
-        ManualResetEventSlim release)
+        ManualResetEventSlim release,
+        Action? beforeRelease = null)
     {
         try
         {
-            return await Record.ExceptionAsync(async () =>
+            var failure = await Record.ExceptionAsync(async () =>
             {
                 using var response = await operation.WaitAsync(
                     PromptSafetyTimeout,
                     TestContext.Current.CancellationToken);
             });
+            beforeRelease?.Invoke();
+            return failure;
         }
         finally
         {

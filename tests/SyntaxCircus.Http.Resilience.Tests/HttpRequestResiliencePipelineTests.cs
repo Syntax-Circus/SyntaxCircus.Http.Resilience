@@ -630,6 +630,7 @@ public class HttpRequestResiliencePipelineTests
         using var cancellation = new CancellationTokenSource();
         var sends = 0;
         var observerCalls = 0;
+        var observerCalled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var followingSends = 0;
         var retryEvents = new List<HttpRetryTelemetry>();
         var circuitEvents = new List<HttpCircuitTelemetry>();
@@ -656,9 +657,13 @@ public class HttpRequestResiliencePipelineTests
             (_, _) =>
             {
                 observerCalls++;
+                observerCalled.TrySetResult();
                 return ValueTask.CompletedTask;
             },
             cancellation.Token));
+
+        await Task.WhenAll(observerCalled.Task, responseContent.DisposeAttemptedTask)
+            .WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
 
         using var following = await SendAsync(
             pipeline,
@@ -1316,7 +1321,12 @@ public class HttpRequestResiliencePipelineTests
 
     private sealed class ThrowingDisposeContent(Exception exception) : HttpContent
     {
+        private readonly TaskCompletionSource _disposeAttempted = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
         public bool DisposeAttempted { get; private set; }
+
+        public Task DisposeAttemptedTask => _disposeAttempted.Task;
 
         protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => Task.CompletedTask;
 
@@ -1329,6 +1339,7 @@ public class HttpRequestResiliencePipelineTests
         protected override void Dispose(bool disposing)
         {
             DisposeAttempted = disposing;
+            _disposeAttempted.TrySetResult();
             base.Dispose(disposing);
             throw exception;
         }
