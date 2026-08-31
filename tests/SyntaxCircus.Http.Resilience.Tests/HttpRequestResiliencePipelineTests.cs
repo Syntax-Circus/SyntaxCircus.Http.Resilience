@@ -689,6 +689,7 @@ public class HttpRequestResiliencePipelineTests
     {
         using var cancellation = new CancellationTokenSource();
         var observerCalls = 0;
+        var observerCalled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var responseContent = new ThrowingDisposeContent(new InvalidOperationException("response cleanup"));
         var pipeline = CreatePipeline(new ManualTimeProvider());
 
@@ -707,9 +708,13 @@ public class HttpRequestResiliencePipelineTests
             (_, _) =>
             {
                 observerCalls++;
+                observerCalled.TrySetResult();
                 throw new InvalidOperationException("observer");
             },
             cancellation.Token));
+
+        await Task.WhenAll(observerCalled.Task, responseContent.DisposeAttemptedTask)
+            .WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
 
         actual.CancellationToken.ShouldBe(cancellation.Token);
         observerCalls.ShouldBe(1);

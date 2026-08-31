@@ -1056,9 +1056,10 @@ public class HttpRequestResilienceFinalFixTests
 
     private static async Task<bool> TryWaitForConditionAsync(Func<bool> condition)
     {
-        for (var i = 0; i < 10_000 && !condition(); i++)
+        var start = TimeProvider.System.GetTimestamp();
+        while (!condition() && TimeProvider.System.GetElapsedTime(start) < SafetyTimeout)
         {
-            await Task.Yield();
+            await Task.Delay(TimeSpan.FromMilliseconds(1), TestContext.Current.CancellationToken);
         }
 
         return condition();
