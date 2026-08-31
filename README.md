@@ -77,6 +77,14 @@ var accessToken = await tokenProvider.GetTokenAsync();
 
 A semaphore-guarded token cache, refreshed under lock once it's within `expirySkew` (default 60s) of expiry. The acquisition delegate is entirely up to you — client-credentials grant, a custom token endpoint, whatever your worker-to-API auth needs.
 
+## Release process
+
+Pull requests and ordinary branch pushes only build and test the repository. They never pack, publish, or tag a package.
+
+An authorized maintainer starts the `Build` workflow manually with the exact package version and full commit SHA from `main`. The workflow builds and tests that source, packs the candidate once, and records its source, raw SHA-256, NuGet content hash, size, and checksums in the uploaded candidate artifact. Publication waits for approval in the protected `release` environment and reuses those exact uploaded bytes. The protected job rejects an existing version, publishes through NuGet trusted publishing, verifies the repository signature and preserved content hash, and creates the version tag only after the public package passes verification.
+
+`publish.ps1` is a local pack-and-test helper only. It cannot publish packages or create tags.
+
 ## Contributing
 
 Issues and pull requests are welcome:
