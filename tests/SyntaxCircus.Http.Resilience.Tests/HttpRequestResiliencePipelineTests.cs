@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http.Headers;
 
 namespace SyntaxCircus.Http.Resilience.Tests;
@@ -1297,9 +1298,11 @@ public class HttpRequestResiliencePipelineTests
 
     private static async Task WaitForTimerCountAsync(ManualTimeProvider timeProvider, int count)
     {
-        for (var i = 0; i < 10_000 && timeProvider.ActiveTimerCount < count; i++)
+        var timeout = TimeSpan.FromSeconds(5);
+        var stopwatch = Stopwatch.StartNew();
+        while (timeProvider.ActiveTimerCount < count && stopwatch.Elapsed < timeout)
         {
-            await Task.Yield();
+            await Task.Delay(TimeSpan.FromMilliseconds(1), TestContext.Current.CancellationToken);
         }
 
         timeProvider.ActiveTimerCount.ShouldBeGreaterThanOrEqualTo(count);
