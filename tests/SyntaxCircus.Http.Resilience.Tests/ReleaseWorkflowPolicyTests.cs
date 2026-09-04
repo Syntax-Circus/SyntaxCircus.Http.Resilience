@@ -9,47 +9,41 @@ public sealed class ReleaseWorkflowPolicyTests
     private static readonly string PublishScript = File.ReadAllText(Path.Combine(RepositoryRoot, "publish.ps1"));
 
     [Fact]
-    public void Ordinary_pushes_and_pull_requests_cannot_pack_or_publish()
+    public void Only_main_pushes_can_pack_or_publish()
     {
-        Workflow.ShouldContain("workflow_dispatch:");
-        Workflow.ShouldContain("if: github.event_name == 'workflow_dispatch'");
-        Workflow.ShouldNotContain("if: github.ref == 'refs/heads/main' && github.event_name == 'push'");
+        Workflow.ShouldContain("if: github.ref == 'refs/heads/main' && github.event_name == 'push'");
+        Workflow.ShouldNotContain("workflow_dispatch:");
+        Workflow.ShouldNotContain("github.event_name == 'workflow_dispatch'");
     }
 
     [Fact]
-    public void Manual_candidate_requires_an_exact_version_and_main_source_sha()
+    public void Main_push_build_packs_and_uploads_the_versioned_package()
     {
-        Workflow.ShouldContain("version:");
-        Workflow.ShouldContain("source_sha:");
-        Workflow.ShouldContain("0.2.0-cmsify.1");
-        Workflow.ShouldContain("github.ref == 'refs/heads/main'");
-        Workflow.ShouldContain("format('http-resilience-release-{0}', inputs.version)");
+        Workflow.ShouldContain("- name: Pack");
+        Workflow.ShouldContain("dotnet pack SyntaxCircus.Http.Resilience.slnx --no-build --configuration Release --output artifacts");
+        Workflow.ShouldContain("- name: Upload package artifact");
+        Workflow.ShouldContain("name: nuget-package");
         Workflow.ShouldContain("cancel-in-progress: false");
-        Workflow.ShouldContain("git merge-base --is-ancestor \"$SOURCE_SHA\" origin/main");
-        Workflow.ShouldContain("test \"$(git rev-parse HEAD)\" = \"$SOURCE_SHA\"");
     }
 
     [Fact]
-    public void Protected_publication_reuses_and_verifies_the_uploaded_candidate()
+    public void Protected_publication_uses_the_uploaded_package_and_trusted_publishing()
     {
         Workflow.ShouldContain("environment: release");
         Workflow.ShouldContain("actions/upload-artifact@");
         Workflow.ShouldContain("actions/download-artifact@");
-        Workflow.ShouldContain("sha256sum --check SHA256SUMS");
-        Workflow.ShouldContain("Reject an existing NuGet version");
-        Workflow.ShouldNotContain("--skip-duplicate");
+        Workflow.ShouldContain("NuGet/login@");
+        Workflow.ShouldContain("dotnet nuget push artifacts/*.nupkg");
+        Workflow.ShouldContain("--skip-duplicate");
     }
 
     [Fact]
-    public void Candidate_build_generates_documentation_required_by_no_build_pack()
+    public void Publication_tag_is_derived_from_the_generated_package()
     {
-        var buildStart = Workflow.IndexOf("- name: Restore, build, and test candidate source", StringComparison.Ordinal);
-        var packStart = Workflow.IndexOf("- name: Pack exact candidate once", StringComparison.Ordinal);
-
-        buildStart.ShouldBeGreaterThanOrEqualTo(0);
-        packStart.ShouldBeGreaterThan(buildStart);
-        Workflow[buildStart..packStart].ShouldContain("-p:GenerateDocumentationFile=true");
-        Workflow[buildStart..packStart].ShouldContain("-p:NoWarn=CA1305%3BCA1707%3BCA1848%3BCS1591%3BCS1573");
+        Workflow.ShouldContain("find artifacts -maxdepth 1 -type f -name '*.nupkg' ! -name '*.snupkg'");
+        Workflow.ShouldContain("version=${package_path##*/SyntaxCircus.Http.Resilience.}");
+        Workflow.ShouldContain("tag=\"v$version\"");
+        Workflow.ShouldContain("git tag \"$tag\" \"$GITHUB_SHA\"");
     }
 
     [Fact]
@@ -63,7 +57,7 @@ public sealed class ReleaseWorkflowPolicyTests
         }
 
         PublishScript.ShouldNotContain("dotnet nuget push");
-        PublishScript.ShouldContain("workflow_dispatch");
+        PublishScript.ShouldContain("main-push release workflow");
     }
 
     private static string FindRepositoryRoot()
