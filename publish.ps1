@@ -5,8 +5,8 @@
 .PARAMETER OutputDirectory
     Where the .nupkg/.snupkg land. Defaults to ./artifacts.
 .DESCRIPTION
-    Public releases are created only by the protected workflow_dispatch path in
-    .github/workflows/build.yml. This helper never pushes packages or tags.
+    Public releases are created only by the protected main-push release workflow
+    in .github/workflows/build.yml. This helper never pushes packages or tags.
 #>
 [CmdletBinding()]
 param(
@@ -49,4 +49,4 @@ foreach ($package in $packages) {
     Write-Host "==> Packed $($package.Name)" -ForegroundColor Green
 }
 
-Write-Host "==> Local candidate only. Use the protected workflow_dispatch release path to publish." -ForegroundColor Yellow
+Write-Host "==> Local candidate only. Use the protected main-push release workflow to publish." -ForegroundColor Yellow

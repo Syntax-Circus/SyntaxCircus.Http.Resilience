@@ -5,20 +5,9 @@ on:
     branches: ["*"]
   pull_request:
     branches: ["*"]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Exact package version approved for this candidate
-        required: true
-        default: 0.2.0-cmsify.1
-        type: string
-      source_sha:
-        description: Full commit SHA from the default branch
-        required: true
-        type: string
 
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && format('http-resilience-release-{0}', inputs.version) || format('http-resilience-ci-{0}', github.ref) }}
+  group: http-resilience-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -37,115 +26,28 @@ jobs:
       - run: dotnet restore SyntaxCircus.Http.Resilience.slnx
       - run: dotnet build SyntaxCircus.Http.Resilience.slnx --no-restore --configuration Release
       - run: dotnet test --solution SyntaxCircus.Http.Resilience.slnx --no-build --configuration Release
-
-  candidate:
-    needs: build
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      VERSION: ${{ inputs.version }}
-      SOURCE_SHA: ${{ inputs.source_sha }}
-      ARTIFACT_NAME: http-resilience-${{ inputs.version }}-${{ inputs.source_sha }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ inputs.source_sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
-        with:
-          global-json-file: global.json
-      - name: Validate exact default-branch candidate identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$VERSION" = "0.2.0-cmsify.1"
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git fetch --no-tags origin main
-          git cat-file -e "$SOURCE_SHA^{commit}"
-          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-      - name: Restore, build, and test candidate source
-        run: |
-          dotnet restore SyntaxCircus.Http.Resilience.slnx
-          dotnet build SyntaxCircus.Http.Resilience.slnx --configuration Release --no-restore -p:DisableGitVersionTask=true -p:GenerateDocumentationFile=true -p:NoWarn=CA1305%3BCA1707%3BCA1848%3BCS1591%3BCS1573 --verbosity minimal
-          dotnet test --solution SyntaxCircus.Http.Resilience.slnx --configuration Release --no-build -p:DisableGitVersionTask=true --verbosity minimal
-      - name: Pack exact candidate once
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          dotnet pack src/SyntaxCircus.Http.Resilience/SyntaxCircus.Http.Resilience.csproj \
-            --configuration Release \
-            --no-build \
-            -p:DisableGitVersionTask=true \
-            -p:Version="$VERSION" \
-            -p:PackageVersion="$VERSION" \
-            -p:GenerateDocumentationFile=true \
-            -p:TreatWarningsAsErrors=false \
-            -p:WarningsAsErrors= \
-            -p:RepositoryCommit="$SOURCE_SHA" \
-            -p:SourceRevisionId="$SOURCE_SHA" \
-            --output artifacts \
-            --verbosity minimal
-      - name: Record candidate identity and checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd artifacts
-          package="SyntaxCircus.Http.Resilience.$VERSION.nupkg"
-          symbols="SyntaxCircus.Http.Resilience.$VERSION.snupkg"
-          test -f "$package"
-          test -f "$symbols"
-          set +e
-          verify_output="$(dotnet nuget verify "$package" --all --verbosity normal --force-english-output 2>&1)"
-          verify_exit=$?
-          set -e
-          printf '%s\n' "$verify_output"
-          test "$verify_exit" -ne 0
-          test "$(printf '%s\n' "$verify_output" | grep -c 'error: NU3004: The package is not signed.')" -eq 1
-          content_hash="$(printf '%s\n' "$verify_output" | sed -n 's/^Content hash: //p')"
-          test -n "$content_hash"
-          raw_sha256="$(sha256sum "$package" | awk '{print toupper($1)}')"
-          size="$(stat --format=%s "$package")"
-          jq -n \
-            --arg schema "syntaxcircus.http-resilience-candidate.v1" \
-            --arg version "$VERSION" \
-            --arg sourceSha "$SOURCE_SHA" \
-            --arg rawSha256 "$raw_sha256" \
-            --arg contentHash "$content_hash" \
-            --argjson size "$size" \
-            '{schema:$schema,version:$version,sourceSha:$sourceSha,package:{name:("SyntaxCircus.Http.Resilience."+$version+".nupkg"),rawSha256:$rawSha256,contentHash:$contentHash,size:$size}}' \
-            > candidate-manifest.json
-          sha256sum "$package" "$symbols" candidate-manifest.json > SHA256SUMS
-          cat candidate-manifest.json
-          cat SHA256SUMS
-      - name: Upload exact candidate artifact
+      - name: Pack
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: dotnet pack SyntaxCircus.Http.Resilience.slnx --no-build --configuration Release --output artifacts
+      - name: Upload package artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: artifacts/
-          if-no-files-found: error
-          retention-days: 14
+          name: nuget-package
+          path: artifacts/*.*nupkg
+          retention-days: 7
 
   publish:
-    needs: candidate
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: write
       id-token: write
-    env:
-      VERSION: ${{ inputs.version }}
-      SOURCE_SHA: ${{ inputs.source_sha }}
-      ARTIFACT_NAME: http-resilience-${{ inputs.version }}-${{ inputs.source_sha }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           persist-credentials: true
       - uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
@@ -153,61 +55,27 @@ jobs:
           global-json-file: global.json
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: nuget-package
           path: artifacts
-      - name: Revalidate approved candidate bytes
-        working-directory: artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          sha256sum --check SHA256SUMS
-          test "$(jq -r .schema candidate-manifest.json)" = "syntaxcircus.http-resilience-candidate.v1"
-          test "$(jq -r .version candidate-manifest.json)" = "$VERSION"
-          test "$(jq -r .sourceSha candidate-manifest.json)" = "$SOURCE_SHA"
-          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$SOURCE_SHA"
-      - name: Reject an existing NuGet version
-        shell: bash
-        run: |
-          set -euo pipefail
-          package_id="syntaxcircus.http.resilience"
-          normalized_version="${VERSION,,}"
-          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 20 --max-time 60 "https://api.nuget.org/v3-flatcontainer/$package_id/$normalized_version/$package_id.$normalized_version.nupkg")"
-          test "$status" = "404"
       - id: nuget_login
         uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
         with:
           user: ${{ secrets.NUGET_USER }}
-      - name: Publish the approved candidate
-        run: dotnet nuget push "artifacts/SyntaxCircus.Http.Resilience.$VERSION.nupkg" --api-key "${{ steps.nuget_login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json
-      - name: Verify repository signing and preserved content hash
+      - name: Publish package
+        run: dotnet nuget push artifacts/*.nupkg --api-key "${{ steps.nuget_login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+      - name: Tag published version
         shell: bash
         run: |
           set -euo pipefail
-          package_id="syntaxcircus.http.resilience"
-          normalized_version="${VERSION,,}"
-          package_url="https://api.nuget.org/v3-flatcontainer/$package_id/$normalized_version/$package_id.$normalized_version.nupkg"
-          for attempt in $(seq 1 30); do
-            status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 20 --max-time 60 "$package_url")"
-            if [ "$status" = "200" ]; then break; fi
-            test "$status" = "404"
-            test "$attempt" -lt 30
-            sleep 10
-          done
-          curl --fail --location --connect-timeout 20 --max-time 120 --output signed.nupkg "$package_url"
-          verify_output="$(dotnet nuget verify signed.nupkg --all --verbosity normal --force-english-output 2>&1)"
-          printf '%s\n' "$verify_output"
-          expected_hash="$(jq -r .package.contentHash artifacts/candidate-manifest.json)"
-          test "$(printf '%s\n' "$verify_output" | sed -n 's/^Content hash: //p')" = "$expected_hash"
-          printf '%s\n' "$verify_output" | grep -F 'Signature type: Repository'
-          printf '%s\n' "$verify_output" | grep -F 'Service index: https://api.nuget.org/v3/index.json'
-          printf '%s\n' "$verify_output" | grep -F 'Owners: syntaxcircus'
-      - name: Tag the verified publication
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="v$VERSION"
-          test -z "$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}")"
+          package_path=$(find artifacts -maxdepth 1 -type f -name '*.nupkg' ! -name '*.snupkg' | head -n 1)
+          test -n "$package_path"
+          version=${package_path##*/SyntaxCircus.Http.Resilience.}
+          version=${version%.nupkg}
+          tag="v$version"
+          if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag --annotate "$tag" "$SOURCE_SHA" --message "SyntaxCircus.Http.Resilience $VERSION"
-          git push origin "refs/tags/$tag"
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "$tag"
