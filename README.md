@@ -145,6 +145,8 @@ Caller cancellation and logical circuit completion have one atomic terminal orde
 
 ## CachedTokenProvider
 
+For applications with durable retry scheduling, see [durable-outbox consumers](docs/outbox-consumer.md). Use one transport attempt and avoid nested retry handlers.
+
 ```csharp
 var tokenProvider = new CachedTokenProvider(async ct =>
 {
