@@ -197,7 +197,7 @@ public class HttpRequestResilienceCriticalFix2Tests
         await factoryEntered.Task.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
         timeProvider.Advance(TimeSpan.FromSeconds(1));
         var promptFailure = await CaptureBeforeReleaseAsync(operation, releaseFactory);
-        await WaitForConditionAsync(() => requestContent.Disposed);
+        await WaitForDisposalAsync(requestContent);
         await ObserveAndDisposeResponseAsync(operation);
 
         promptFailure.ShouldBeOfType<HttpRequestTimeoutException>();
@@ -256,10 +256,7 @@ public class HttpRequestResilienceCriticalFix2Tests
                 requestContent.Disposed.ShouldBeFalse();
                 responseContent.Disposed.ShouldBeFalse();
             });
-        await WaitForConditionAsync(() =>
-            requestContent.Disposed
-            && responseContent.Disposed
-            && Volatile.Read(ref observerCalls) == 1);
+        await WaitForDisposalAsync(requestContent, responseContent);
         await ObserveAndDisposeResponseAsync(operation);
 
         promptFailure.ShouldBeOfType<HttpRequestTimeoutException>();
@@ -315,7 +312,7 @@ public class HttpRequestResilienceCriticalFix2Tests
                 requestContent.Disposed.ShouldBeFalse();
                 responseContent.Disposed.ShouldBeFalse();
             });
-        await WaitForConditionAsync(() => requestContent.Disposed && responseContent.Disposed);
+        await WaitForDisposalAsync(requestContent, responseContent);
         await ObserveAndDisposeResponseAsync(operation);
 
         promptFailure.ShouldBeOfType<HttpRequestTimeoutException>();
@@ -408,15 +405,16 @@ public class HttpRequestResilienceCriticalFix2Tests
         await delegateEntered.Task.WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
         cancellation.Cancel();
         var promptFailure = await CaptureBeforeReleaseAsync(operation, releaseDelegate);
-        await WaitForConditionAsync(() => requestContent.Disposed);
+        await WaitForDisposalAsync(requestContent);
         if (boundary != SynchronousBoundary.Factory)
         {
-            await WaitForConditionAsync(() => responseContent.Disposed && Volatile.Read(ref observerCalls) == 1);
+            await WaitForDisposalAsync(responseContent);
         }
         await ObserveAndDisposeResponseAsync(operation);
 
         var canceled = promptFailure.ShouldBeOfType<OperationCanceledException>();
         canceled.CancellationToken.ShouldBe(cancellation.Token);
+        observerCalls.ShouldBe(boundary == SynchronousBoundary.Factory ? 0 : 1);
         retryEvents.ShouldBeEmpty();
         circuitEvents.ShouldBeEmpty();
     }
@@ -506,14 +504,14 @@ public class HttpRequestResilienceCriticalFix2Tests
     private static TaskCompletionSource NewSignal()
         => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    private static async Task WaitForConditionAsync(Func<bool> condition)
+    private static async Task WaitForDisposalAsync(params TrackingContent[] contents)
     {
-        for (var i = 0; i < 10_000 && !condition(); i++)
-        {
-            await Task.Yield();
-        }
-
-        condition().ShouldBeTrue();
+        // Late cleanup runs independently after the caller has received cancellation/timeout.
+        // Scheduler yields give it no bounded amount of time, especially on a busy single CPU.
+        await Task.WhenAll(contents.Select(content => content.DisposalTask))
+            .WaitAsync(PromptSafetyTimeout, TestContext.Current.CancellationToken);
+        foreach (var content in contents)
+            content.Disposed.ShouldBeTrue();
     }
 
     public enum SynchronousBoundary
@@ -525,9 +523,12 @@ public class HttpRequestResilienceCriticalFix2Tests
 
     private sealed class TrackingContent : HttpContent
     {
+        private readonly TaskCompletionSource _disposal = NewSignal();
         private int _disposed;
 
         public bool Disposed => Volatile.Read(ref _disposed) != 0;
+
+        public Task DisposalTask => _disposal.Task;
 
         protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
             => Task.CompletedTask;
@@ -540,8 +541,9 @@ public class HttpRequestResilienceCriticalFix2Tests
 
         protected override void Dispose(bool disposing)
         {
-            Interlocked.Exchange(ref _disposed, 1);
             base.Dispose(disposing);
+            Interlocked.Exchange(ref _disposed, 1);
+            _disposal.TrySetResult();
         }
     }
 
